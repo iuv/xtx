@@ -41,3 +41,37 @@ func (e *chatEntry) TypedShortcut(shortcut fyne.Shortcut) {
 	e.Entry.TypedShortcut(shortcut)
 }
 
+// readOnlyEntry 是气泡内展示文本的只读 Entry：
+// 保留 widget.Entry 的鼠标选择 + 系统级 Ctrl/Cmd+C 复制能力，
+// 但屏蔽打字、粘贴、剪切等写入操作。
+type readOnlyEntry struct {
+	widget.Entry
+}
+
+func newReadOnlyEntry() *readOnlyEntry {
+	e := &readOnlyEntry{}
+	e.ExtendBaseWidget(e)
+	e.MultiLine = true
+	e.Wrapping = fyne.TextWrapWord
+	return e
+}
+
+// TypedRune 丢弃所有可见字符输入。
+func (e *readOnlyEntry) TypedRune(rune) {}
+
+// TypedKey 只放行光标移动 / 选择相关的键，其它（退格、回车、删除等）忽略。
+func (e *readOnlyEntry) TypedKey(ev *fyne.KeyEvent) {
+	switch ev.Name {
+	case fyne.KeyLeft, fyne.KeyRight, fyne.KeyUp, fyne.KeyDown,
+		fyne.KeyHome, fyne.KeyEnd, fyne.KeyPageUp, fyne.KeyPageDown:
+		e.Entry.TypedKey(ev)
+	}
+}
+
+// TypedShortcut 只放行 Copy / SelectAll，屏蔽 Paste / Cut / Undo / Redo。
+func (e *readOnlyEntry) TypedShortcut(s fyne.Shortcut) {
+	switch s.(type) {
+	case *fyne.ShortcutCopy, *fyne.ShortcutSelectAll:
+		e.Entry.TypedShortcut(s)
+	}
+}

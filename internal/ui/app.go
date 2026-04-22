@@ -328,7 +328,6 @@ func (a *App) buildUI() {
 	a.refreshSelfInfo()
 
 	bottomBar := container.NewVBox(
-		widget.NewSeparator(),
 		container.NewPadded(a.selfInfoLabel),
 		createGroupBtn,
 	)
@@ -353,8 +352,13 @@ func (a *App) buildUI() {
 		},
 		func() fyne.CanvasObject {
 			nameLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-			contentLabel := widget.NewLabel("")
-			contentLabel.Wrapping = fyne.TextWrapWord
+			// 文本用只读 Entry 展示，可鼠标选中并 Ctrl/Cmd+C 复制。
+			contentEntry := newReadOnlyEntry()
+			// 局部主题：让 Entry 的输入背景透明，气泡色透出来。
+			contentWrap := container.NewThemeOverride(
+				contentEntry,
+				&bubbleContentTheme{base: a.fyneApp.Settings().Theme()},
+			)
 
 			// 图片气泡
 			img := canvas.NewImageFromResource(nil)
@@ -382,7 +386,10 @@ func (a *App) buildUI() {
 			// 气泡背景 + 内容
 			bubbleRect := canvas.NewRectangle(color.Transparent)
 			bubbleRect.CornerRadius = 10
-			innerBox := container.NewPadded(container.NewVBox(nameLabel, contentLabel, imgContainer, fileCard))
+			// 自定义紧凑布局：name 在上，其余（content/img/file，同时只可见一个）占剩余空间，
+			// 这样 WrapWord Entry/Label 会被强制设置成实际高度，避免按 1 行 MinSize 裁切。
+			bubbleContent := container.New(&tightBubbleLayout{}, nameLabel, contentWrap, imgContainer, fileCard)
+			innerBox := container.NewPadded(bubbleContent)
 			bubble := container.NewStack(bubbleRect, innerBox)
 			// 每个 row 绑定自己的 bubbleRowLayout 实例，update 时切换 rightAlign
 			return container.New(&bubbleRowLayout{}, bubble)
@@ -407,7 +414,8 @@ func (a *App) buildUI() {
 			paddedBox := bubble.Objects[1].(*fyne.Container)
 			vbox := paddedBox.Objects[0].(*fyne.Container)
 			nameLabel := vbox.Objects[0].(*widget.Label)
-			contentLabel := vbox.Objects[1].(*widget.Label)
+			contentWrap := vbox.Objects[1].(*fyne.Container) // ThemeOverride 包裹只读 Entry
+			contentEntry := contentWrap.Objects[0].(*readOnlyEntry)
 			imgContainer := vbox.Objects[2].(*fyne.Container)
 			fileCard := vbox.Objects[3].(*fyne.Container)
 			img := imgContainer.Objects[0].(*canvas.Image)
@@ -436,7 +444,7 @@ func (a *App) buildUI() {
 
 			switch msg.Type {
 			case model.ChatImage:
-				contentLabel.Hide()
+				contentWrap.Hide()
 				imgContainer.Show()
 				img.Show()
 				imgBtn.Show()
@@ -450,7 +458,7 @@ func (a *App) buildUI() {
 					a.showFullImage(imgPath)
 				}
 			case model.ChatFile:
-				contentLabel.Hide()
+				contentWrap.Hide()
 				imgContainer.Hide()
 				fileCard.Show()
 				fileName.SetText(msg.Filename)
@@ -464,8 +472,8 @@ func (a *App) buildUI() {
 				localPath := msg.Content
 				fileOpenBtn.OnTapped = func() { openPath(localPath) }
 			default:
-				contentLabel.Show()
-				contentLabel.SetText(msg.Content)
+				contentWrap.Show()
+				contentEntry.SetText(msg.Content)
 				imgContainer.Hide()
 				fileCard.Hide()
 			}
@@ -1327,14 +1335,26 @@ func (a *App) handleFileComplete(msg *model.ChatMessage) {
 	a.scheduleRefreshSidePanel()
 }
 
-// appTheme 全局主题：在用户选定的基础主题上只做一点定制
-// （目前仅去掉输入框描边）。不动 primary 色，保证光标、选中高亮颜色
-// 走 Fyne 默认，避免在 Linux/macOS 某些场景下光标与背景同色不可见。
+// appTheme 全局主题：在用户选定的基础主题上做若干定制。
+// - 输入框描边为 0、背景纯白，让光标清晰可见；
+// - primary 色改为浅绿（widget.Entry 的光标走 primary），用于排查光标不可见问题；
+// - 分隔线厚度为 0，隐藏 widget.List 条目间灰色横线。
 type appTheme struct {
 	base fyne.Theme
 }
 
+var (
+	inputBgWhite    = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	cursorLightGrn  = color.RGBA{R: 76, G: 175, B: 80, A: 255}  // #4CAF50 偏亮绿，对比纯白
+)
+
 func (t *appTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	switch n {
+	case theme.ColorNameInputBackground:
+		return inputBgWhite
+	case theme.ColorNamePrimary:
+		return cursorLightGrn
+	}
 	return t.base.Color(n, v)
 }
 func (t *appTheme) Font(s fyne.TextStyle) fyne.Resource { return t.base.Font(s) }
@@ -1342,11 +1362,30 @@ func (t *appTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
 	return t.base.Icon(n)
 }
 func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
-	if n == theme.SizeNameInputBorder {
+	switch n {
+	case theme.SizeNameInputBorder:
+		return 0
+	case theme.SizeNameSeparatorThickness:
 		return 0
 	}
 	return t.base.Size(n)
 }
+
+// bubbleContentTheme 用于气泡内文本 Entry 的局部主题：
+// 只把 InputBackground 改成透明，让气泡自己的底色透出来，其它走外层 appTheme。
+type bubbleContentTheme struct {
+	base fyne.Theme
+}
+
+func (t *bubbleContentTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if n == theme.ColorNameInputBackground {
+		return color.Transparent
+	}
+	return t.base.Color(n, v)
+}
+func (t *bubbleContentTheme) Font(s fyne.TextStyle) fyne.Resource  { return t.base.Font(s) }
+func (t *bubbleContentTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return t.base.Icon(n) }
+func (t *bubbleContentTheme) Size(n fyne.ThemeSizeName) float32    { return t.base.Size(n) }
 
 // wrapBaseTheme 从设置字符串解析出基础主题并包一层 appTheme。
 func wrapBaseTheme(setting string) fyne.Theme {
@@ -1419,14 +1458,74 @@ func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	bubble.Resize(fyne.NewSize(w, h))
 }
 
+// tightBubbleLayout 紧凑气泡内容布局：
+//   - objs[0] 为 name 标签，固定按 MinSize 高度贴顶放置；
+//   - 其余 objs 视为"内容区"（文本 / 图片容器 / 文件卡片，同一时间只有一个可见），
+//     紧接 name 之下，填满容器剩余高度，强制 WrapWord 文本展开到目标高度。
+//
+// 与 container.NewVBox 的区别：VBox 在子项间插入整 pad 间距，且按子 MinSize 分配高度，
+// 导致 WrapWord Label 只被给 1 行高、最后一行超出气泡。
+type tightBubbleLayout struct{}
+
+// nameContentGap name 与 content 之间的纵向间距（pad 的一半）。
+func tightNameGap() float32 { return theme.Padding() / 2 }
+
+func (l *tightBubbleLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	if len(objs) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	var maxW, h float32
+	name := objs[0]
+	nameMS := name.MinSize()
+	h = nameMS.Height
+	maxW = nameMS.Width
+	for _, o := range objs[1:] {
+		if !o.Visible() {
+			continue
+		}
+		ms := o.MinSize()
+		if ms.Width > maxW {
+			maxW = ms.Width
+		}
+		h += tightNameGap() + ms.Height
+		break // 只会有一个可见
+	}
+	return fyne.NewSize(maxW, h)
+}
+
+func (l *tightBubbleLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	if len(objs) == 0 {
+		return
+	}
+	name := objs[0]
+	nameH := name.MinSize().Height
+	name.Move(fyne.NewPos(0, 0))
+	name.Resize(fyne.NewSize(size.Width, nameH))
+	y := nameH + tightNameGap()
+	remainH := size.Height - y
+	if remainH < 0 {
+		remainH = 0
+	}
+	for _, o := range objs[1:] {
+		if !o.Visible() {
+			continue
+		}
+		o.Move(fyne.NewPos(0, y))
+		o.Resize(fyne.NewSize(size.Width, remainH))
+	}
+}
+
 // measureBubble 估算单条消息气泡的目标宽高。
 // 返回 (w, h)，任一为 0 时表示该维度回退到气泡自身 MinSize。
+//
+// 气泡层级：Stack(矩形) → Padded(pad 四周) → tightBubbleLayout(name + 内容)。
+// 所以横向内边距 = pad*2，纵向内边距 = pad*2，name 与内容之间 = pad/2。
 func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32, float32) {
 	textSize := theme.TextSize()
 	pad := theme.Padding()
-	// 气泡内层 = container.NewPadded + VBox，合计横向大约 pad*4、纵向 pad*4
-	innerPadH := pad * 4
-	innerPadV := pad * 4
+	innerPadH := pad * 2 // Padded 左右
+	innerPadV := pad * 2 // Padded 上下
+	nameGap := pad / 2   // name 与内容之间
 
 	rowW := a.chatHistory.Size().Width
 	if rowW < 100 {
@@ -1444,21 +1543,25 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 
 	nameSize := fyne.MeasureText(nameText, textSize, fyne.TextStyle{Bold: true})
 	lineH := fyne.MeasureText("国", textSize, fyne.TextStyle{}).Height
+	// widget.Label 多行渲染每行实际占用 > MeasureText 返回的紧排高度，
+	// 加一点 line-spacing 余量，避免最后一行被气泡裁掉。
+	effLineH := lineH + pad/2
 
 	switch msg.Type {
 	case model.ChatImage:
-		// 图片最小 200x150，加上 name 和 padding
-		w := float32(200) + innerPadH
-		if nameSize.Width+innerPadH > w {
-			w = nameSize.Width + innerPadH
+		// 图片最小 200x150
+		contentW := float32(200)
+		if nameSize.Width > contentW {
+			contentW = nameSize.Width
 		}
+		w := contentW + innerPadH
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		h := nameSize.Height + 150 + innerPadV + pad
+		h := innerPadV + nameSize.Height + nameGap + 150
 		return w, h
 	case model.ChatFile:
-		// 文件卡片：固定偏宽，显示文件名 + 大小 + 打开按钮
+		// 文件卡片：固定偏宽
 		w := maxBubbleW * 0.65
 		if w < 260 {
 			w = 260
@@ -1466,7 +1569,8 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		h := nameSize.Height + lineH*2 + innerPadV + pad*2
+		// 文件卡片内含图标 + 文件名 + meta 行，大约 lineH*2 + pad
+		h := innerPadV + nameSize.Height + nameGap + lineH*2 + pad
 		return w, h
 	default:
 		// 文本：按行测量，超过 maxContentW 则模拟换行
@@ -1500,7 +1604,7 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		h := nameSize.Height + float32(lines)*lineH + innerPadV + pad
+		h := innerPadV + nameSize.Height + nameGap + float32(lines)*effLineH + pad/2
 		return w, h
 	}
 }
