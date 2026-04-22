@@ -66,6 +66,16 @@ func (s *Service) Events() <-chan Event {
 	return s.events
 }
 
+// emit 非阻塞发送事件。通道满则丢弃：UI 下一次事件或定时刷新可恢复状态，
+// 不能让消费者慢导致 receive/checkTimeout 卡住。
+func (s *Service) emit(evt Event) {
+	select {
+	case s.events <- evt:
+	default:
+		log.Printf("发现事件通道已满，丢弃事件 type=%d", evt.Type)
+	}
+}
+
 // GetUsers 获取所有用户
 func (s *Service) GetUsers() []*model.User {
 	s.mu.RLock()
@@ -323,7 +333,7 @@ func (s *Service) handleMessage(msg model.BroadcastMsg) {
 		s.mu.Unlock()
 
 		if !exists || msg.Type == model.MsgOnline {
-			s.events <- Event{Type: EventUserOnline, User: user}
+			s.emit(Event{Type: EventUserOnline, User: user})
 			// 回复自己的在线状态
 			if msg.Type == model.MsgOnline {
 				s.broadcast(model.MsgHeartbeat)
@@ -336,7 +346,7 @@ func (s *Service) handleMessage(msg model.BroadcastMsg) {
 		if user, ok := s.users[key]; ok {
 			user.Online = false
 			s.mu.Unlock()
-			s.events <- Event{Type: EventUserOffline, User: user}
+			s.emit(Event{Type: EventUserOffline, User: user})
 		} else {
 			s.mu.Unlock()
 		}
@@ -353,7 +363,7 @@ func (s *Service) handleMessage(msg model.BroadcastMsg) {
 			s.mu.Lock()
 			s.groups[g.ID] = g
 			s.mu.Unlock()
-			s.events <- Event{Type: EventGroupCreated, Group: g, IP: msg.IP}
+			s.emit(Event{Type: EventGroupCreated, Group: g, IP: msg.IP})
 		}
 
 	case model.MsgGroupUpdate:
@@ -362,7 +372,7 @@ func (s *Service) handleMessage(msg model.BroadcastMsg) {
 			g.Name = msg.GroupName
 			g.Members = msg.Members
 			s.mu.Unlock()
-			s.events <- Event{Type: EventGroupUpdated, Group: g, IP: msg.IP}
+			s.emit(Event{Type: EventGroupUpdated, Group: g, IP: msg.IP})
 		} else if s.isMember(msg.Members) {
 			// 新加入的群
 			g := &model.Group{
@@ -373,7 +383,7 @@ func (s *Service) handleMessage(msg model.BroadcastMsg) {
 			}
 			s.groups[g.ID] = g
 			s.mu.Unlock()
-			s.events <- Event{Type: EventGroupCreated, Group: g, IP: msg.IP}
+			s.emit(Event{Type: EventGroupCreated, Group: g, IP: msg.IP})
 		} else {
 			s.mu.Unlock()
 		}
@@ -390,7 +400,7 @@ func (s *Service) handleMessage(msg model.BroadcastMsg) {
 			}
 			g.Members = members
 			s.mu.Unlock()
-			s.events <- Event{Type: EventGroupQuit, Group: g, IP: msg.IP}
+			s.emit(Event{Type: EventGroupQuit, Group: g, IP: msg.IP})
 		} else {
 			s.mu.Unlock()
 		}
@@ -450,14 +460,18 @@ func (s *Service) checkTimeout() {
 		case <-s.quit:
 			return
 		case <-ticker.C:
+			var offlined []*model.User
 			s.mu.Lock()
 			for _, user := range s.users {
 				if user.Online && time.Since(user.LastSeen) > model.HeartbeatTimeout {
 					user.Online = false
-					s.events <- Event{Type: EventUserOffline, User: user}
+					offlined = append(offlined, user)
 				}
 			}
 			s.mu.Unlock()
+			for _, u := range offlined {
+				s.emit(Event{Type: EventUserOffline, User: u})
+			}
 		}
 	}
 }

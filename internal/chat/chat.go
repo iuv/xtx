@@ -12,6 +12,10 @@ import (
 	"github.com/ixx/xtx/internal/model"
 )
 
+// 单条 TCP 消息最大长度。小图内嵌上限 2MB → base64 ≈ 2.7MB，
+// 文件分块 512KB → base64 ≈ 700KB，留足余量并防止恶意/异常输入耗尽内存。
+const maxMessageBytes = 8 * 1024 * 1024
+
 // FileEvent 文件传输事件
 type FileEvent struct {
 	Msg *model.ChatMessage
@@ -88,9 +92,13 @@ func (s *Service) handleConn(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	data, err := io.ReadAll(conn)
+	data, err := io.ReadAll(io.LimitReader(conn, maxMessageBytes+1))
 	if err != nil {
 		log.Printf("读取TCP消息失败: %v", err)
+		return
+	}
+	if len(data) > maxMessageBytes {
+		log.Printf("TCP消息超出上限 %d 字节，丢弃", maxMessageBytes)
 		return
 	}
 

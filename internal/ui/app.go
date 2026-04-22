@@ -73,7 +73,13 @@ type App struct {
 	pendingFiles map[string]string // fileID -> 本地文件路径（待发送）
 	receivingFiles map[string]*receivingFile // fileID -> 接收中的文件
 	fileMu       sync.Mutex
+
+	// 侧边栏刷新防抖：合并 100ms 内的多次事件触发的刷新
+	refreshMu    sync.Mutex
+	refreshTimer *time.Timer
 }
+
+const sideRefreshDebounce = 100 * time.Millisecond
 
 type receivingFile struct {
 	filename   string
@@ -420,12 +426,12 @@ func (a *App) handleDiscoveryEvents() {
 	for evt := range a.discovery.Events() {
 		switch evt.Type {
 		case discovery.EventUserOnline, discovery.EventUserOffline:
-			a.refreshSidePanel()
+			a.scheduleRefreshSidePanel()
 		case discovery.EventGroupCreated, discovery.EventGroupUpdated:
 			if evt.Group != nil {
 				_ = a.store.SaveGroup(evt.Group)
 			}
-			a.refreshSidePanel()
+			a.scheduleRefreshSidePanel()
 		case discovery.EventGroupQuit:
 			if evt.Group != nil {
 				if evt.IP == a.discovery.LocalIP() {
@@ -434,7 +440,7 @@ func (a *App) handleDiscoveryEvents() {
 					_ = a.store.SaveGroup(evt.Group)
 				}
 			}
-			a.refreshSidePanel()
+			a.scheduleRefreshSidePanel()
 		}
 	}
 }
@@ -506,8 +512,25 @@ func (a *App) handleIncomingMessages() {
 			a.fyneApp.SendNotification(fyne.NewNotification(msg.From, body))
 		}
 
-		a.refreshSidePanel()
+		a.scheduleRefreshSidePanel()
 	}
+}
+
+// scheduleRefreshSidePanel 在防抖窗口内合并多次刷新，适合高频事件路径。
+// 首次调用时立即安排 100ms 后执行，窗口内其它调用被吞掉。
+func (a *App) scheduleRefreshSidePanel() {
+	a.refreshMu.Lock()
+	if a.refreshTimer != nil {
+		a.refreshMu.Unlock()
+		return
+	}
+	a.refreshTimer = time.AfterFunc(sideRefreshDebounce, func() {
+		a.refreshMu.Lock()
+		a.refreshTimer = nil
+		a.refreshMu.Unlock()
+		a.refreshSidePanel()
+	})
+	a.refreshMu.Unlock()
 }
 
 func (a *App) refreshSidePanel() {
@@ -1142,7 +1165,7 @@ func (a *App) handleFileComplete(msg *model.ChatMessage) {
 		a.chatHistory.Refresh()
 		a.chatHistory.ScrollToBottom()
 	}
-	a.refreshSidePanel()
+	a.scheduleRefreshSidePanel()
 }
 
 func formatFileSize(size int64) string {

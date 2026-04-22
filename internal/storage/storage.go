@@ -2,9 +2,11 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 
@@ -185,14 +187,14 @@ func (s *DB) SetSetting(key, value string) error {
 }
 
 func marshalMembers(members []string) string {
-	result := ""
-	for i, m := range members {
-		if i > 0 {
-			result += ","
-		}
-		result += m
+	if members == nil {
+		members = []string{}
 	}
-	return result
+	b, err := json.Marshal(members)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
 }
 
 // SearchMessages 搜索聊天记录
@@ -223,12 +225,19 @@ func unmarshalMembers(s string) []string {
 	if s == "" {
 		return nil
 	}
-	var members []string
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ',' {
-			members = append(members, s[start:i])
-			start = i + 1
+	// 新格式: JSON 数组
+	if strings.HasPrefix(strings.TrimSpace(s), "[") {
+		var members []string
+		if err := json.Unmarshal([]byte(s), &members); err == nil {
+			return members
+		}
+	}
+	// 兼容旧格式: 逗号分隔
+	parts := strings.Split(s, ",")
+	members := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			members = append(members, p)
 		}
 	}
 	return members
