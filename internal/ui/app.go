@@ -124,14 +124,9 @@ func New(disc *discovery.Service, chatSvc *chat.Service, store *db.DB) *App {
 		unreadCounts:   make(map[string]int),
 	}
 
-	// 从存储加载并应用主题设置
+	// 从存储加载并应用主题设置（统一包一层 appTheme，保证输入框无描边）
 	themeSetting, _ := store.GetSetting("theme")
-	switch themeSetting {
-	case "light":
-		a.fyneApp.Settings().SetTheme(theme.LightTheme())
-	case "dark":
-		a.fyneApp.Settings().SetTheme(theme.DarkTheme())
-	}
+	a.fyneApp.Settings().SetTheme(wrapBaseTheme(themeSetting))
 
 	a.window = a.fyneApp.NewWindow("XTX - 局域网聊天")
 	a.window.Resize(fyne.NewSize(900, 600))
@@ -172,9 +167,13 @@ func (a *App) Run() {
 		a.store.Close()
 	})
 
-	// 窗口首次聚焦时把焦点交给输入框，确保光标可见
+	// 窗口聚焦：标记状态、清零当前会话未读、把焦点交给输入框
 	a.fyneApp.Lifecycle().SetOnEnteredForeground(func() {
 		a.windowFocused = true
+		a.mu.Lock()
+		sid := a.currentSID
+		a.mu.Unlock()
+		a.clearUnread(sid)
 		if a.chatInput != nil {
 			a.window.Canvas().Focus(a.chatInput)
 		}
@@ -368,10 +367,8 @@ func (a *App) buildUI() {
 			bubbleRect.CornerRadius = 10
 			innerBox := container.NewPadded(container.NewVBox(nameLabel, contentLabel, imgContainer, fileCard))
 			bubble := container.NewStack(bubbleRect, innerBox)
-			// Border: bubble 居中，左右 spacer 决定对齐方向
-			leftSpacer := widget.NewLabel("")
-			rightSpacer := widget.NewLabel("")
-			return container.NewBorder(nil, nil, leftSpacer, rightSpacer, bubble)
+			// 每个 row 绑定自己的 bubbleRowLayout 实例，update 时切换 rightAlign
+			return container.New(&bubbleRowLayout{}, bubble)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			a.mu.Lock()
@@ -384,11 +381,9 @@ func (a *App) buildUI() {
 			localIP := a.discovery.LocalIP()
 			a.mu.Unlock()
 
-			// Border: Objects = [center, left, right]
-			borderContainer := obj.(*fyne.Container)
-			bubble := borderContainer.Objects[0].(*fyne.Container)
-			leftSpacer := borderContainer.Objects[1].(*widget.Label)
-			rightSpacer := borderContainer.Objects[2].(*widget.Label)
+			row := obj.(*fyne.Container)
+			rowLayout := row.Layout.(*bubbleRowLayout)
+			bubble := row.Objects[0].(*fyne.Container)
 
 			bubbleRect := bubble.Objects[0].(*canvas.Rectangle)
 			paddedBox := bubble.Objects[1].(*fyne.Container)
@@ -406,19 +401,17 @@ func (a *App) buildUI() {
 			fileMeta := fileBottom.Objects[1].(*canvas.Text)
 			fileOpenBtn := fileBottom.Objects[2].(*widget.Button)
 
-			// 气泡方向 + 颜色（自定义浅色，默认文字色即可辨识）
+			// 气泡方向 + 颜色
 			isMine := msg.FromIP == localIP
+			rowLayout.rightAlign = isMine
 			variant := a.fyneApp.Settings().ThemeVariant()
 			if isMine {
-				leftSpacer.Show()
-				rightSpacer.Hide()
 				bubbleRect.FillColor = selfBubbleColor(variant)
 			} else {
-				leftSpacer.Hide()
-				rightSpacer.Show()
 				bubbleRect.FillColor = otherBubbleColor(variant)
 			}
 			bubbleRect.Refresh()
+			row.Refresh()
 
 			t := time.Unix(msg.Timestamp, 0).Format("15:04")
 			nameLabel.SetText(fmt.Sprintf("%s  %s", msg.FromNick, t))
@@ -470,10 +463,6 @@ func (a *App) buildUI() {
 	sendMode, _ := a.store.GetSetting("send_mode")
 	a.chatInput.enterToSend = sendMode != "ctrl_enter"
 
-	// 无边框主题
-	entryTheme := &borderlessEntryTheme{parent: a.fyneApp.Settings().Theme()}
-	entryContainer := container.NewThemeOverride(a.chatInput, entryTheme)
-
 	sendBtn := widget.NewButtonWithIcon("发送", theme.MailSendIcon(), func() {
 		a.sendTextMessage()
 	})
@@ -486,7 +475,7 @@ func (a *App) buildUI() {
 	screenshotBtn := widget.NewButtonWithIcon("", theme.ContentCutIcon(), func() { a.startScreenshot() })
 
 	toolRow := container.NewHBox(fileBtn, imgBtn, emojiBtn, screenshotBtn)
-	inputRow := container.NewBorder(nil, nil, nil, sendBtn, entryContainer)
+	inputRow := container.NewBorder(nil, nil, nil, sendBtn, a.chatInput)
 	inputBar := container.NewVBox(toolRow, inputRow)
 
 	chatTitle := widget.NewLabel("选择一个用户或群聊开始聊天")
@@ -796,6 +785,7 @@ func (a *App) sendTextMessage() {
 	a.chatInput.SetText("")
 	a.chatHistory.Refresh()
 	a.chatHistory.ScrollToBottom()
+	a.clearUnread(s.id)
 }
 
 func (a *App) sendImageMessage() {
@@ -863,6 +853,7 @@ func (a *App) sendImageMessage() {
 
 		a.chatHistory.Refresh()
 		a.chatHistory.ScrollToBottom()
+		a.clearUnread(s.id)
 	}, a.window)
 
 	dlg.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}))
@@ -1035,7 +1026,9 @@ func (a *App) sendFileRequest() {
 			a.fileMu.Lock()
 			delete(a.pendingFiles, fileID)
 			a.fileMu.Unlock()
+			return
 		}
+		a.clearUnread(s.id)
 	}, a.window)
 	dlg.Show()
 }
@@ -1302,6 +1295,103 @@ func (a *App) handleFileComplete(msg *model.ChatMessage) {
 	a.scheduleRefreshSidePanel()
 }
 
+// appTheme 全局主题：在用户选定的基础主题上只做一点定制
+// （目前仅去掉输入框描边）。不动 primary 色，保证光标、选中高亮颜色
+// 走 Fyne 默认，避免在 Linux/macOS 某些场景下光标与背景同色不可见。
+type appTheme struct {
+	base fyne.Theme
+}
+
+func (t *appTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	return t.base.Color(n, v)
+}
+func (t *appTheme) Font(s fyne.TextStyle) fyne.Resource { return t.base.Font(s) }
+func (t *appTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
+	return t.base.Icon(n)
+}
+func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
+	if n == theme.SizeNameInputBorder {
+		return 0
+	}
+	return t.base.Size(n)
+}
+
+// wrapBaseTheme 从设置字符串解析出基础主题并包一层 appTheme。
+func wrapBaseTheme(setting string) fyne.Theme {
+	var base fyne.Theme
+	switch setting {
+	case "light":
+		base = theme.LightTheme()
+	case "dark":
+		base = theme.DarkTheme()
+	default:
+		base = theme.DefaultTheme()
+	}
+	return &appTheme{base: base}
+}
+
+// bubbleRowLayout 把单个气泡子节点按左/右对齐放在整行里，
+// 气泡最大宽度限制为行宽的 bubbleMaxRatio，超出后内部的 WrapWord
+// 标签会自动换行。高度以气泡 MinSize 为准，widget.List 会在刷新时
+// 重新测量每一行的尺寸。
+type bubbleRowLayout struct {
+	rightAlign bool
+}
+
+const (
+	bubbleMaxRatio = 0.72
+	bubbleMinWidth = 80
+)
+
+func (l *bubbleRowLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	if len(objs) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	ms := objs[0].MinSize()
+	// 宽度声明为 0，让父容器（widget.List 的滚动区）按可用宽度给我们分配；
+	// 高度用气泡自身的 MinSize（内部 WrapWord 会根据实际宽度调整）。
+	return fyne.NewSize(0, ms.Height)
+}
+
+func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	if len(objs) == 0 {
+		return
+	}
+	bubble := objs[0]
+	natural := bubble.MinSize()
+	maxW := size.Width * bubbleMaxRatio
+	w := natural.Width
+	if w > maxW {
+		w = maxW
+	}
+	if w < bubbleMinWidth && bubbleMinWidth <= size.Width {
+		w = bubbleMinWidth
+	}
+	if w > size.Width {
+		w = size.Width
+	}
+	var x float32
+	if l.rightAlign {
+		x = size.Width - w
+	}
+	bubble.Move(fyne.NewPos(x, 0))
+	bubble.Resize(fyne.NewSize(w, size.Height))
+}
+
+// clearUnread 清除指定会话的未读计数（如果有）并刷新侧边栏。
+func (a *App) clearUnread(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	a.mu.Lock()
+	had := a.unreadCounts[sessionID] > 0
+	delete(a.unreadCounts, sessionID)
+	a.mu.Unlock()
+	if had {
+		a.scheduleRefreshSidePanel()
+	}
+}
+
 // selfBubbleColor / otherBubbleColor 返回不同主题下的气泡背景色。
 // 选择浅色使默认文本颜色（暗/亮主题自适应）依然清晰可读。
 func selfBubbleColor(variant fyne.ThemeVariant) color.Color {
@@ -1414,6 +1504,7 @@ func (a *App) sendImageFromPath(imgPath string) {
 
 	a.chatHistory.Refresh()
 	a.chatHistory.ScrollToBottom()
+	a.clearUnread(s.id)
 }
 
 func (a *App) tryPasteClipboardImage() bool {
@@ -1568,14 +1659,12 @@ func (a *App) showSettingsDialog() {
 		switch themeSelect.Selected {
 		case "亮色":
 			themeVal = "light"
-			a.fyneApp.Settings().SetTheme(theme.LightTheme())
 		case "暗色":
 			themeVal = "dark"
-			a.fyneApp.Settings().SetTheme(theme.DarkTheme())
 		default:
 			themeVal = ""
-			a.fyneApp.Settings().SetTheme(theme.DefaultTheme())
 		}
+		a.fyneApp.Settings().SetTheme(wrapBaseTheme(themeVal))
 		_ = a.store.SetSetting("theme", themeVal)
 	}, a.window)
 
