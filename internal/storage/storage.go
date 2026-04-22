@@ -55,6 +55,7 @@ func (s *DB) init() error {
 			scope TEXT NOT NULL,
 			from_nick TEXT NOT NULL,
 			from_ip TEXT NOT NULL,
+			from_port INTEGER NOT NULL DEFAULT 0,
 			type TEXT NOT NULL,
 			content TEXT NOT NULL,
 			filename TEXT,
@@ -75,6 +76,14 @@ func (s *DB) init() error {
 	for _, q := range queries {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("初始化数据库失败: %w", err)
+		}
+	}
+	// 旧数据库升级：如果 messages 表存在但没有 from_port 列，加上。
+	// SQLite 对已有 ADD COLUMN 会报错，吞掉 "duplicate column" 情况即可。
+	if _, err := s.db.Exec(`ALTER TABLE messages ADD COLUMN from_port INTEGER NOT NULL DEFAULT 0`); err != nil {
+		msg := err.Error()
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return fmt.Errorf("升级 messages 表失败: %w", err)
 		}
 	}
 	return nil
@@ -98,9 +107,9 @@ func (s *DB) FileDir() string {
 // SaveMessage 保存聊天记录
 func (s *DB) SaveMessage(msg *model.StoredMessage) error {
 	_, err := s.db.Exec(
-		`INSERT INTO messages (session_id, scope, from_nick, from_ip, type, content, filename, timestamp)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		msg.SessionID, msg.Scope, msg.FromNick, msg.FromIP, msg.Type, msg.Content, msg.Filename, msg.Timestamp,
+		`INSERT INTO messages (session_id, scope, from_nick, from_ip, from_port, type, content, filename, timestamp)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		msg.SessionID, msg.Scope, msg.FromNick, msg.FromIP, msg.FromPort, msg.Type, msg.Content, msg.Filename, msg.Timestamp,
 	)
 	return err
 }
@@ -108,7 +117,7 @@ func (s *DB) SaveMessage(msg *model.StoredMessage) error {
 // LoadMessages 加载指定会话的聊天记录
 func (s *DB) LoadMessages(sessionID string, limit int) ([]*model.StoredMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id, session_id, scope, from_nick, from_ip, type, content, filename, timestamp
+		`SELECT id, session_id, scope, from_nick, from_ip, from_port, type, content, filename, timestamp
 		 FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?`,
 		sessionID, limit,
 	)
@@ -120,7 +129,7 @@ func (s *DB) LoadMessages(sessionID string, limit int) ([]*model.StoredMessage, 
 	var msgs []*model.StoredMessage
 	for rows.Next() {
 		m := &model.StoredMessage{}
-		err := rows.Scan(&m.ID, &m.SessionID, &m.Scope, &m.FromNick, &m.FromIP, &m.Type, &m.Content, &m.Filename, &m.Timestamp)
+		err := rows.Scan(&m.ID, &m.SessionID, &m.Scope, &m.FromNick, &m.FromIP, &m.FromPort, &m.Type, &m.Content, &m.Filename, &m.Timestamp)
 		if err != nil {
 			return nil, err
 		}
@@ -200,7 +209,7 @@ func marshalMembers(members []string) string {
 // SearchMessages 搜索聊天记录
 func (s *DB) SearchMessages(keyword string, limit int) ([]*model.StoredMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT id, session_id, scope, from_nick, from_ip, type, content, filename, timestamp
+		`SELECT id, session_id, scope, from_nick, from_ip, from_port, type, content, filename, timestamp
 		 FROM messages WHERE type = 'text' AND content LIKE ? ORDER BY timestamp DESC LIMIT ?`,
 		"%"+keyword+"%", limit,
 	)
@@ -212,7 +221,7 @@ func (s *DB) SearchMessages(keyword string, limit int) ([]*model.StoredMessage, 
 	var msgs []*model.StoredMessage
 	for rows.Next() {
 		m := &model.StoredMessage{}
-		err := rows.Scan(&m.ID, &m.SessionID, &m.Scope, &m.FromNick, &m.FromIP, &m.Type, &m.Content, &m.Filename, &m.Timestamp)
+		err := rows.Scan(&m.ID, &m.SessionID, &m.Scope, &m.FromNick, &m.FromIP, &m.FromPort, &m.Type, &m.Content, &m.Filename, &m.Timestamp)
 		if err != nil {
 			return nil, err
 		}

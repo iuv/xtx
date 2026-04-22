@@ -112,6 +112,7 @@ type StoredMessage struct {
 	Scope     string
 	FromNick  string
 	FromIP    string
+	FromPort  int // 发送方 TCP 端口，用于区分同机多实例
 	Type      string
 	Content   string
 	Filename  string

@@ -57,7 +57,8 @@ type App struct {
 	chatHistory    *widget.List
 	chatInput      *chatEntry
 	chatTitleLabel *widget.Label
-	sessionKeys    []string // 有序的会话key列表
+	selfInfoLabel  *widget.Label // 左侧底部"当前用户"信息
+	sessionKeys    []string      // 有序的会话key列表
 
 	// 截图快捷键
 	screenshotShortcut *desktop.CustomShortcut
@@ -179,7 +180,13 @@ func (a *App) Run() {
 		}
 	})
 
-	a.window.ShowAndRun()
+	// 先 Show 再 Run，确保 canvas 初始化后立刻把焦点给输入框，
+	// 避免某些平台 OnEnteredForeground 不会在首次显示时触发导致光标不出现。
+	a.window.Show()
+	if a.chatInput != nil {
+		a.window.Canvas().Focus(a.chatInput)
+	}
+	a.fyneApp.Run()
 }
 
 func (a *App) buildUI() {
@@ -316,9 +323,19 @@ func (a *App) buildUI() {
 		filterEntry,
 	)
 
+	a.selfInfoLabel = widget.NewLabel("")
+	a.selfInfoLabel.TextStyle = fyne.TextStyle{Italic: true}
+	a.refreshSelfInfo()
+
+	bottomBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewPadded(a.selfInfoLabel),
+		createGroupBtn,
+	)
+
 	leftPanel := container.NewBorder(
 		topBar,
-		createGroupBtn,
+		bottomBar,
 		nil, nil,
 		a.userList,
 	)
@@ -379,6 +396,7 @@ func (a *App) buildUI() {
 			}
 			msg := s.messages[id]
 			localIP := a.discovery.LocalIP()
+			localPort := a.discovery.TCPPort()
 			a.mu.Unlock()
 
 			row := obj.(*fyne.Container)
@@ -397,12 +415,12 @@ func (a *App) buildUI() {
 			fileRight := fileCard.Objects[0].(*fyne.Container)
 			fileName := fileRight.Objects[0].(*widget.Label)
 			fileBottom := fileRight.Objects[1].(*fyne.Container)
-			// Border: [center, left, right] → center=widget.NewLabel("") at [0], meta left=[1], btn right=[2]
+			// fileBottom 是 Border：Objects = [center, left(meta), right(btn)]
 			fileMeta := fileBottom.Objects[1].(*canvas.Text)
 			fileOpenBtn := fileBottom.Objects[2].(*widget.Button)
 
-			// 气泡方向 + 颜色
-			isMine := msg.FromIP == localIP
+			// 气泡方向：同机多实例需按 IP+Port 判断
+			isMine := msg.FromIP == localIP && msg.FromPort == localPort
 			rowLayout.rightAlign = isMine
 			variant := a.fyneApp.Settings().ThemeVariant()
 			if isMine {
@@ -411,10 +429,10 @@ func (a *App) buildUI() {
 				bubbleRect.FillColor = otherBubbleColor(variant)
 			}
 			bubbleRect.Refresh()
-			row.Refresh()
 
 			t := time.Unix(msg.Timestamp, 0).Format("15:04")
-			nameLabel.SetText(fmt.Sprintf("%s  %s", msg.FromNick, t))
+			nameText := fmt.Sprintf("%s  %s", msg.FromNick, t)
+			nameLabel.SetText(nameText)
 
 			switch msg.Type {
 			case model.ChatImage:
@@ -450,6 +468,15 @@ func (a *App) buildUI() {
 				contentLabel.SetText(msg.Content)
 				imgContainer.Hide()
 				fileCard.Hide()
+			}
+
+			// 计算气泡目标尺寸，避免 WrapWord 下 MinSize 只返 1 行高导致溢出
+			targetW, targetH := a.measureBubble(msg, nameText)
+			rowLayout.targetW = targetW
+			rowLayout.targetH = targetH
+			row.Refresh()
+			if targetH > 0 {
+				a.chatHistory.SetItemHeight(id, targetH)
 			}
 		},
 	)
@@ -560,6 +587,7 @@ func (a *App) handleIncomingMessages() {
 			Scope:     msg.Scope,
 			FromNick:  msg.From,
 			FromIP:    msg.FromIP,
+			FromPort:  msg.FromPort,
 			Type:      msg.Type,
 			Content:   msg.Content,
 			Filename:  filename,
@@ -772,6 +800,7 @@ func (a *App) sendTextMessage() {
 		Scope:     s.scope,
 		FromNick:  a.discovery.Nickname(),
 		FromIP:    a.discovery.LocalIP(),
+		FromPort:  a.discovery.TCPPort(),
 		Type:      model.ChatText,
 		Content:   text,
 		Timestamp: now,
@@ -840,6 +869,7 @@ func (a *App) sendImageMessage() {
 			Scope:     s.scope,
 			FromNick:  a.discovery.Nickname(),
 			FromIP:    a.discovery.LocalIP(),
+			FromPort:  a.discovery.TCPPort(),
 			Type:      model.ChatImage,
 			Content:   imgPath,
 			Filename:  filename,
@@ -1195,6 +1225,7 @@ func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string)
 		Scope:     scope,
 		FromNick:  a.discovery.Nickname(),
 		FromIP:    a.discovery.LocalIP(),
+		FromPort:  a.discovery.TCPPort(),
 		Type:      model.ChatFile,
 		Content:   filePath,
 		Filename:  filename,
@@ -1271,6 +1302,7 @@ func (a *App) handleFileComplete(msg *model.ChatMessage) {
 		Scope:     rf.scope,
 		FromNick:  rf.fromNick,
 		FromIP:    rf.fromIP,
+		FromPort:  rf.fromPort,
 		Type:      model.ChatFile,
 		Content:   destPath,
 		Filename:  rf.filename,
@@ -1330,12 +1362,14 @@ func wrapBaseTheme(setting string) fyne.Theme {
 	return &appTheme{base: base}
 }
 
-// bubbleRowLayout 把单个气泡子节点按左/右对齐放在整行里，
-// 气泡最大宽度限制为行宽的 bubbleMaxRatio，超出后内部的 WrapWord
-// 标签会自动换行。高度以气泡 MinSize 为准，widget.List 会在刷新时
-// 重新测量每一行的尺寸。
+// bubbleRowLayout 把单个气泡子节点按左/右对齐放在整行里。
+// update 回调会把 targetW / targetH 填好（通过 fyne.MeasureText 手算），
+// MinSize/Layout 就按目标尺寸走——避免了 widget.Label(WrapWord) MinSize
+// 只返 1 行高导致内容溢出的问题。
 type bubbleRowLayout struct {
 	rightAlign bool
+	targetW    float32 // <=0 表示按气泡 MinSize
+	targetH    float32 // <=0 表示按气泡 MinSize
 }
 
 const (
@@ -1347,10 +1381,11 @@ func (l *bubbleRowLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	if len(objs) == 0 {
 		return fyne.NewSize(0, 0)
 	}
-	ms := objs[0].MinSize()
-	// 宽度声明为 0，让父容器（widget.List 的滚动区）按可用宽度给我们分配；
-	// 高度用气泡自身的 MinSize（内部 WrapWord 会根据实际宽度调整）。
-	return fyne.NewSize(0, ms.Height)
+	h := l.targetH
+	if h <= 0 {
+		h = objs[0].MinSize().Height
+	}
+	return fyne.NewSize(0, h)
 }
 
 func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
@@ -1358,9 +1393,11 @@ func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 		return
 	}
 	bubble := objs[0]
-	natural := bubble.MinSize()
+	w := l.targetW
+	if w <= 0 {
+		w = bubble.MinSize().Width
+	}
 	maxW := size.Width * bubbleMaxRatio
-	w := natural.Width
 	if w > maxW {
 		w = maxW
 	}
@@ -1370,12 +1407,111 @@ func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	if w > size.Width {
 		w = size.Width
 	}
+	h := l.targetH
+	if h <= 0 {
+		h = size.Height
+	}
 	var x float32
 	if l.rightAlign {
 		x = size.Width - w
 	}
 	bubble.Move(fyne.NewPos(x, 0))
-	bubble.Resize(fyne.NewSize(w, size.Height))
+	bubble.Resize(fyne.NewSize(w, h))
+}
+
+// measureBubble 估算单条消息气泡的目标宽高。
+// 返回 (w, h)，任一为 0 时表示该维度回退到气泡自身 MinSize。
+func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32, float32) {
+	textSize := theme.TextSize()
+	pad := theme.Padding()
+	// 气泡内层 = container.NewPadded + VBox，合计横向大约 pad*4、纵向 pad*4
+	innerPadH := pad * 4
+	innerPadV := pad * 4
+
+	rowW := a.chatHistory.Size().Width
+	if rowW < 100 {
+		if cs := a.window.Canvas().Size(); cs.Width > 0 {
+			rowW = cs.Width * 0.72
+		} else {
+			rowW = 640
+		}
+	}
+	maxBubbleW := rowW * bubbleMaxRatio
+	maxContentW := maxBubbleW - innerPadH
+	if maxContentW < 80 {
+		maxContentW = 80
+	}
+
+	nameSize := fyne.MeasureText(nameText, textSize, fyne.TextStyle{Bold: true})
+	lineH := fyne.MeasureText("国", textSize, fyne.TextStyle{}).Height
+
+	switch msg.Type {
+	case model.ChatImage:
+		// 图片最小 200x150，加上 name 和 padding
+		w := float32(200) + innerPadH
+		if nameSize.Width+innerPadH > w {
+			w = nameSize.Width + innerPadH
+		}
+		if w > maxBubbleW {
+			w = maxBubbleW
+		}
+		h := nameSize.Height + 150 + innerPadV + pad
+		return w, h
+	case model.ChatFile:
+		// 文件卡片：固定偏宽，显示文件名 + 大小 + 打开按钮
+		w := maxBubbleW * 0.65
+		if w < 260 {
+			w = 260
+		}
+		if w > maxBubbleW {
+			w = maxBubbleW
+		}
+		h := nameSize.Height + lineH*2 + innerPadV + pad*2
+		return w, h
+	default:
+		// 文本：按行测量，超过 maxContentW 则模拟换行
+		lines := 0
+		maxLineW := float32(0)
+		for _, line := range strings.Split(msg.Content, "\n") {
+			if line == "" {
+				lines++
+				continue
+			}
+			lineW := fyne.MeasureText(line, textSize, fyne.TextStyle{}).Width
+			if lineW <= maxContentW {
+				lines++
+				if lineW > maxLineW {
+					maxLineW = lineW
+				}
+			} else {
+				n := int(lineW/maxContentW) + 1
+				lines += n
+				maxLineW = maxContentW
+			}
+		}
+		if lines == 0 {
+			lines = 1
+		}
+		contentW := maxLineW
+		if contentW < nameSize.Width {
+			contentW = nameSize.Width
+		}
+		w := contentW + innerPadH
+		if w > maxBubbleW {
+			w = maxBubbleW
+		}
+		h := nameSize.Height + float32(lines)*lineH + innerPadV + pad
+		return w, h
+	}
+}
+
+// refreshSelfInfo 更新左侧底部当前用户的昵称/地址显示。
+func (a *App) refreshSelfInfo() {
+	if a.selfInfoLabel == nil {
+		return
+	}
+	a.selfInfoLabel.SetText(fmt.Sprintf("我: %s (%s:%d)",
+		a.discovery.Nickname(), a.discovery.LocalIP(), a.discovery.TCPPort()))
 }
 
 // clearUnread 清除指定会话的未读计数（如果有）并刷新侧边栏。
@@ -1491,6 +1627,7 @@ func (a *App) sendImageFromPath(imgPath string) {
 		Scope:     s.scope,
 		FromNick:  a.discovery.Nickname(),
 		FromIP:    a.discovery.LocalIP(),
+		FromPort:  a.discovery.TCPPort(),
 		Type:      model.ChatImage,
 		Content:   localPath,
 		Filename:  filename,
@@ -1624,6 +1761,7 @@ func (a *App) showSettingsDialog() {
 		if newNick != "" && newNick != a.discovery.Nickname() {
 			_ = a.store.SetSetting("nickname", newNick)
 			a.discovery.SetNickname(newNick)
+			a.refreshSelfInfo()
 		}
 
 		// 保存额外广播地址
