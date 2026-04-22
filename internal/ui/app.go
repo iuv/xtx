@@ -3,9 +3,12 @@ package ui
 import (
 	"encoding/base64"
 	"fmt"
+	"image/color"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -77,6 +80,9 @@ type App struct {
 	// 侧边栏刷新防抖：合并 100ms 内的多次事件触发的刷新
 	refreshMu    sync.Mutex
 	refreshTimer *time.Timer
+
+	// 未读消息计数：sessionID -> 未读条数。当前会话/窗口聚焦时不计数
+	unreadCounts map[string]int
 }
 
 const sideRefreshDebounce = 100 * time.Millisecond
@@ -94,11 +100,15 @@ type receivingFile struct {
 }
 
 type sideItem struct {
-	label   string
-	id      string // IP or GroupID
-	scope   string
-	online  bool
-	isGroup bool
+	label    string // 仅用于搜索匹配
+	name     string // 主显示（昵称或群名）
+	subtitle string // 副标题（IP / "N 人" / "离线"）
+	id       string // IP:port 或 GroupID 或 "_sep"
+	scope    string
+	online   bool
+	isGroup  bool
+	isSep    bool
+	unread   int
 }
 
 // New 创建应用
@@ -111,6 +121,7 @@ func New(disc *discovery.Service, chatSvc *chat.Service, store *db.DB) *App {
 		sessions:       make(map[string]*session),
 		pendingFiles:   make(map[string]string),
 		receivingFiles: make(map[string]*receivingFile),
+		unreadCounts:   make(map[string]int),
 	}
 
 	// 从存储加载并应用主题设置
@@ -139,8 +150,7 @@ func (a *App) Run() {
 	a.buildUI()
 	a.loadStoredGroups()
 
-	// 跟踪窗口焦点
-	a.fyneApp.Lifecycle().SetOnEnteredForeground(func() { a.windowFocused = true })
+	// 窗口失焦跟踪（聚焦回调在 SetOnClosed 后配置，同时把焦点交给输入框）
 	a.fyneApp.Lifecycle().SetOnExitedForeground(func() { a.windowFocused = false })
 
 	// 注册 Ctrl+Enter 快捷键（始终可用于发送）
@@ -162,6 +172,14 @@ func (a *App) Run() {
 		a.store.Close()
 	})
 
+	// 窗口首次聚焦时把焦点交给输入框，确保光标可见
+	a.fyneApp.Lifecycle().SetOnEnteredForeground(func() {
+		a.windowFocused = true
+		if a.chatInput != nil {
+			a.window.Canvas().Focus(a.chatInput)
+		}
+	})
+
 	a.window.ShowAndRun()
 }
 
@@ -174,10 +192,22 @@ func (a *App) buildUI() {
 			return len(a.filteredItems)
 		},
 		func() fyne.CanvasObject {
-			return container.NewHBox(
-				widget.NewIcon(theme.AccountIcon()),
-				widget.NewLabel("placeholder"),
-			)
+			icon := widget.NewIcon(theme.AccountIcon())
+			name := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			sub := canvas.NewText("", theme.Color(theme.ColorNameDisabled))
+			sub.TextSize = theme.TextSize() - 2
+			info := container.NewVBox(name, sub)
+			// 未读红点徽标：圆角矩形 + 白色数字
+			badgeBg := canvas.NewRectangle(color.NRGBA{R: 227, G: 60, B: 60, A: 255})
+			badgeBg.CornerRadius = 9
+			badgeText := canvas.NewText("", color.White)
+			badgeText.Alignment = fyne.TextAlignCenter
+			badgeText.TextStyle = fyne.TextStyle{Bold: true}
+			badgeText.TextSize = theme.TextSize() - 2
+			badge := container.NewGridWrap(fyne.NewSize(28, 18),
+				container.NewStack(badgeBg, container.NewCenter(badgeText)))
+			badge.Hide()
+			return container.NewBorder(nil, nil, icon, badge, info)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			a.mu.Lock()
@@ -188,9 +218,28 @@ func (a *App) buildUI() {
 			item := a.filteredItems[id]
 			a.mu.Unlock()
 
-			box := obj.(*fyne.Container)
-			icon := box.Objects[0].(*widget.Icon)
-			label := box.Objects[1].(*widget.Label)
+			border := obj.(*fyne.Container)
+			// Border: [center, left, right] order
+			info := border.Objects[0].(*fyne.Container)
+			icon := border.Objects[1].(*widget.Icon)
+			badge := border.Objects[2].(*fyne.Container)
+			name := info.Objects[0].(*widget.Label)
+			sub := info.Objects[1].(*canvas.Text)
+			// Badge 内部：Stack(bg, Center(text))
+			badgeInner := badge.Objects[0].(*fyne.Container)
+			badgeText := badgeInner.Objects[1].(*fyne.Container).Objects[0].(*canvas.Text)
+
+			if item.isSep {
+				icon.Hide()
+				badge.Hide()
+				sub.Hide()
+				name.TextStyle = fyne.TextStyle{Italic: true}
+				name.SetText(item.name)
+				return
+			}
+
+			icon.Show()
+			name.TextStyle = fyne.TextStyle{Bold: true}
 
 			if item.isGroup {
 				icon.SetResource(theme.MailComposeIcon())
@@ -199,7 +248,28 @@ func (a *App) buildUI() {
 			} else {
 				icon.SetResource(theme.VisibilityOffIcon())
 			}
-			label.SetText(item.label)
+			name.SetText(item.name)
+
+			if item.subtitle == "" {
+				sub.Hide()
+			} else {
+				sub.Show()
+				sub.Text = item.subtitle
+				sub.Color = theme.Color(theme.ColorNameDisabled)
+				sub.Refresh()
+			}
+
+			if item.unread > 0 {
+				if item.unread > 99 {
+					badgeText.Text = "99+"
+				} else {
+					badgeText.Text = fmt.Sprintf("%d", item.unread)
+				}
+				badgeText.Refresh()
+				badge.Show()
+			} else {
+				badge.Hide()
+			}
 		},
 	)
 	a.userList.OnSelected = func(id widget.ListItemID) {
@@ -269,6 +339,8 @@ func (a *App) buildUI() {
 			nameLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			contentLabel := widget.NewLabel("")
 			contentLabel.Wrapping = fyne.TextWrapWord
+
+			// 图片气泡
 			img := canvas.NewImageFromResource(nil)
 			img.SetMinSize(fyne.NewSize(200, 150))
 			img.FillMode = canvas.ImageFillContain
@@ -277,12 +349,26 @@ func (a *App) buildUI() {
 			imgBtn.Importance = widget.LowImportance
 			imgBtn.Hidden = true
 			imgContainer := container.NewStack(img, imgBtn)
-			bubbleRect := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
-			bubbleRect.CornerRadius = 8
-			innerBox := container.NewPadded(container.NewVBox(nameLabel, contentLabel, imgContainer))
+			imgContainer.Hidden = true
+
+			// 文件卡片：图标 + 文件名 + 大小 + 打开按钮
+			fileIcon := widget.NewIcon(theme.FileIcon())
+			fileName := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			fileMeta := canvas.NewText("", theme.Color(theme.ColorNameDisabled))
+			fileMeta.TextSize = theme.TextSize() - 2
+			fileOpenBtn := widget.NewButton("打开", nil)
+			fileOpenBtn.Importance = widget.LowImportance
+			fileBottom := container.NewBorder(nil, nil, fileMeta, fileOpenBtn, widget.NewLabel(""))
+			fileRight := container.NewVBox(fileName, fileBottom)
+			fileCard := container.NewBorder(nil, nil, fileIcon, nil, fileRight)
+			fileCard.Hidden = true
+
+			// 气泡背景 + 内容
+			bubbleRect := canvas.NewRectangle(color.Transparent)
+			bubbleRect.CornerRadius = 10
+			innerBox := container.NewPadded(container.NewVBox(nameLabel, contentLabel, imgContainer, fileCard))
 			bubble := container.NewStack(bubbleRect, innerBox)
-			// 用 Border 布局实现左右对齐：bubble 居中，左右用 spacer 占位
-			// 自己的消息靠右(leftSpacer可见)，对方消息靠左(rightSpacer可见)
+			// Border: bubble 居中，左右 spacer 决定对齐方向
 			leftSpacer := widget.NewLabel("")
 			rightSpacer := widget.NewLabel("")
 			return container.NewBorder(nil, nil, leftSpacer, rightSpacer, bubble)
@@ -298,8 +384,7 @@ func (a *App) buildUI() {
 			localIP := a.discovery.LocalIP()
 			a.mu.Unlock()
 
-			// NewBorder puts center objects first, then left, right
-			// So: Objects[0]=bubble, Objects[1]=leftSpacer, Objects[2]=rightSpacer
+			// Border: Objects = [center, left, right]
 			borderContainer := obj.(*fyne.Container)
 			bubble := borderContainer.Objects[0].(*fyne.Container)
 			leftSpacer := borderContainer.Objects[1].(*widget.Label)
@@ -311,19 +396,27 @@ func (a *App) buildUI() {
 			nameLabel := vbox.Objects[0].(*widget.Label)
 			contentLabel := vbox.Objects[1].(*widget.Label)
 			imgContainer := vbox.Objects[2].(*fyne.Container)
+			fileCard := vbox.Objects[3].(*fyne.Container)
 			img := imgContainer.Objects[0].(*canvas.Image)
 			imgBtn := imgContainer.Objects[1].(*widget.Button)
+			fileRight := fileCard.Objects[0].(*fyne.Container)
+			fileName := fileRight.Objects[0].(*widget.Label)
+			fileBottom := fileRight.Objects[1].(*fyne.Container)
+			// Border: [center, left, right] → center=widget.NewLabel("") at [0], meta left=[1], btn right=[2]
+			fileMeta := fileBottom.Objects[1].(*canvas.Text)
+			fileOpenBtn := fileBottom.Objects[2].(*widget.Button)
 
-			// 气泡方向
+			// 气泡方向 + 颜色（自定义浅色，默认文字色即可辨识）
 			isMine := msg.FromIP == localIP
+			variant := a.fyneApp.Settings().ThemeVariant()
 			if isMine {
 				leftSpacer.Show()
 				rightSpacer.Hide()
-				bubbleRect.FillColor = theme.Color(theme.ColorNamePrimary)
+				bubbleRect.FillColor = selfBubbleColor(variant)
 			} else {
 				leftSpacer.Hide()
 				rightSpacer.Show()
-				bubbleRect.FillColor = theme.Color(theme.ColorNameInputBackground)
+				bubbleRect.FillColor = otherBubbleColor(variant)
 			}
 			bubbleRect.Refresh()
 
@@ -332,10 +425,11 @@ func (a *App) buildUI() {
 
 			switch msg.Type {
 			case model.ChatImage:
-				contentLabel.Hidden = true
-				img.Hidden = false
-				imgBtn.Hidden = false
-				imgContainer.Hidden = false
+				contentLabel.Hide()
+				imgContainer.Show()
+				img.Show()
+				imgBtn.Show()
+				fileCard.Hide()
 				if msg.Content != "" {
 					img.File = msg.Content
 					img.Refresh()
@@ -345,17 +439,24 @@ func (a *App) buildUI() {
 					a.showFullImage(imgPath)
 				}
 			case model.ChatFile:
-				contentLabel.Hidden = false
-				contentLabel.SetText("[文件] " + msg.Filename)
-				img.Hidden = true
-				imgBtn.Hidden = true
-				imgContainer.Hidden = true
+				contentLabel.Hide()
+				imgContainer.Hide()
+				fileCard.Show()
+				fileName.SetText(msg.Filename)
+				meta := "文件"
+				if fi, err := os.Stat(msg.Content); err == nil {
+					meta = formatFileSize(fi.Size())
+				}
+				fileMeta.Text = meta
+				fileMeta.Color = theme.Color(theme.ColorNameDisabled)
+				fileMeta.Refresh()
+				localPath := msg.Content
+				fileOpenBtn.OnTapped = func() { openPath(localPath) }
 			default:
-				contentLabel.Hidden = false
+				contentLabel.Show()
 				contentLabel.SetText(msg.Content)
-				img.Hidden = true
-				imgBtn.Hidden = true
-				imgContainer.Hidden = true
+				imgContainer.Hide()
+				fileCard.Hide()
 			}
 		},
 	)
@@ -491,6 +592,10 @@ func (a *App) handleIncomingMessages() {
 		}
 		s.messages = append(s.messages, stored)
 		isCurrentSession := a.currentSID == sessionID
+		// 非当前会话或窗口不聚焦 → 计入未读
+		if !isCurrentSession || !a.windowFocused {
+			a.unreadCounts[sessionID]++
+		}
 		a.mu.Unlock()
 
 		if isCurrentSession {
@@ -548,28 +653,47 @@ func (a *App) refreshSidePanel() {
 		return groups[i].Name < groups[j].Name
 	})
 
+	a.mu.Lock()
+	unread := make(map[string]int, len(a.unreadCounts))
+	for k, v := range a.unreadCounts {
+		unread[k] = v
+	}
+	a.mu.Unlock()
+
 	items := make([]sideItem, 0, len(users)+len(groups)+1)
 	for _, u := range users {
-		label := u.Nickname
+		sub := u.IP
 		if !u.Online {
-			label += " (离线)"
+			sub = "离线"
 		}
 		items = append(items, sideItem{
-			label:   label,
-			id:      u.Key(),
-			scope:   model.ScopePrivate,
-			online:  u.Online,
-			isGroup: false,
+			label:    u.Nickname + " " + u.IP,
+			name:     u.Nickname,
+			subtitle: sub,
+			id:       u.Key(),
+			scope:    model.ScopePrivate,
+			online:   u.Online,
+			isGroup:  false,
+			unread:   unread[u.Key()],
 		})
 	}
 	if len(groups) > 0 {
-		items = append(items, sideItem{label: "── 群聊 ──", id: "_sep", scope: "_sep"})
+		items = append(items, sideItem{
+			name:  "── 群聊 ──",
+			label: "── 群聊 ──",
+			id:    "_sep",
+			scope: "_sep",
+			isSep: true,
+		})
 		for _, g := range groups {
 			items = append(items, sideItem{
-				label:   fmt.Sprintf("[群] %s (%d人)", g.Name, len(g.Members)),
-				id:      g.ID,
-				scope:   model.ScopeGroup,
-				isGroup: true,
+				label:    g.Name,
+				name:     g.Name,
+				subtitle: fmt.Sprintf("%d 人", len(g.Members)),
+				id:       g.ID,
+				scope:    model.ScopeGroup,
+				isGroup:  true,
+				unread:   unread[g.ID],
 			})
 		}
 	}
@@ -600,12 +724,22 @@ func (a *App) switchSession(id, scope, label string) {
 		}
 	}
 	a.currentSID = id
+	// 清除未读
+	clearedUnread := a.unreadCounts[id] > 0
+	delete(a.unreadCounts, id)
 	a.mu.Unlock()
 
 	a.chatTitleLabel.SetText(fmt.Sprintf("与 %s 的对话", label))
 	a.chatHistory.Refresh()
 	if len(s.messages) > 0 {
 		a.chatHistory.ScrollToBottom()
+	}
+	if clearedUnread {
+		a.scheduleRefreshSidePanel()
+	}
+	// 切换会话后把焦点交给输入框，方便直接打字
+	if a.chatInput != nil {
+		a.window.Canvas().Focus(a.chatInput)
 	}
 }
 
@@ -1166,6 +1300,41 @@ func (a *App) handleFileComplete(msg *model.ChatMessage) {
 		a.chatHistory.ScrollToBottom()
 	}
 	a.scheduleRefreshSidePanel()
+}
+
+// selfBubbleColor / otherBubbleColor 返回不同主题下的气泡背景色。
+// 选择浅色使默认文本颜色（暗/亮主题自适应）依然清晰可读。
+func selfBubbleColor(variant fyne.ThemeVariant) color.Color {
+	if variant == theme.VariantDark {
+		return color.NRGBA{R: 46, G: 92, B: 60, A: 255} // 深绿
+	}
+	return color.NRGBA{R: 197, G: 234, B: 166, A: 255} // 浅绿（仿微信）
+}
+
+func otherBubbleColor(variant fyne.ThemeVariant) color.Color {
+	if variant == theme.VariantDark {
+		return color.NRGBA{R: 62, G: 62, B: 64, A: 255} // 深灰
+	}
+	return color.NRGBA{R: 244, G: 244, B: 246, A: 255} // 近白
+}
+
+// openPath 用系统默认程序打开文件或目录
+func openPath(path string) {
+	if path == "" {
+		return
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("打开 %s 失败: %v", path, err)
+	}
 }
 
 func formatFileSize(size int64) string {

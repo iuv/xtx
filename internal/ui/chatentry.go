@@ -53,6 +53,14 @@ func (t *borderlessEntryTheme) Color(name fyne.ThemeColorName, variant fyne.Them
 	if name == theme.ColorNameInputBorder {
 		return color.Transparent
 	}
+	// Fyne 的光标使用 ColorNamePrimary 绘制，某些系统主题下这个色值
+	// 与输入背景过近导致光标不可见。这里强制给出高对比度的蓝色。
+	if name == theme.ColorNamePrimary {
+		if variant == theme.VariantDark {
+			return color.NRGBA{R: 120, G: 190, B: 255, A: 255}
+		}
+		return color.NRGBA{R: 25, G: 118, B: 210, A: 255}
+	}
 	return t.parent.Color(name, variant)
 }
 
