@@ -232,7 +232,8 @@ func (a *App) buildUI() {
 		func() fyne.CanvasObject {
 			icon := widget.NewIcon(theme.AccountIcon())
 			name := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-			sub := canvas.NewText("", theme.Color(theme.ColorNameDisabled))
+			// 副标题（IP / 离线 / N 人）用主前景色，颜色比默认 Disabled 灰加深更清晰。
+			sub := canvas.NewText("", theme.Color(theme.ColorNameForeground))
 			sub.TextSize = theme.TextSize() - 2
 			info := container.NewVBox(name, sub)
 			// 未读红点徽标：圆角矩形 + 白色数字
@@ -293,7 +294,7 @@ func (a *App) buildUI() {
 			} else {
 				sub.Show()
 				sub.Text = item.subtitle
-				sub.Color = theme.Color(theme.ColorNameDisabled)
+				sub.Color = theme.Color(theme.ColorNameForeground)
 				sub.Refresh()
 			}
 
@@ -562,7 +563,10 @@ func (a *App) buildUI() {
 	chatInputWrap := container.NewThemeOverride(a.chatInput,
 		&chatInputTheme{base: a.fyneApp.Settings().Theme()})
 	inputRow := container.NewBorder(nil, nil, nil, sendBtn, chatInputWrap)
-	inputBar := container.NewVBox(toolRow, inputRow)
+	// 工具栏与上方聊天区之间留 20px 空隙，避免最后一条气泡贴着工具条。
+	toolbarGap := canvas.NewRectangle(color.Transparent)
+	toolbarGap.SetMinSize(fyne.NewSize(1, 20))
+	inputBar := container.NewVBox(toolbarGap, toolRow, inputRow)
 
 	chatTitle := widget.NewLabel("选择一个用户或群聊开始聊天")
 	a.chatTitleLabel = chatTitle
@@ -572,11 +576,16 @@ func (a *App) buildUI() {
 	})
 	chatTitleBar := container.NewHBox(chatTitle, layout.NewSpacer(), searchHistoryBtn)
 
+	// 聊天列表用主题覆盖包一层，把 List 行的悬停/选中底色都改为透明，
+	// 避免鼠标悬停时气泡后面出现灰色高亮。
+	chatHistoryWrap := container.NewThemeOverride(a.chatHistory,
+		&chatListTheme{base: a.fyneApp.Settings().Theme()})
+
 	rightPanel := container.NewBorder(
 		chatTitleBar,
 		inputBar,
 		nil, nil,
-		a.chatHistory,
+		chatHistoryWrap,
 	)
 
 	// --- 主布局 ---
@@ -1466,41 +1475,72 @@ func (a *App) handleFileData(msg *model.ChatMessage) {
 	a.fileMu.Unlock()
 }
 
+// handleFileComplete 收到发送方的"传输完成"信令。
+// 由于 chat.Service 每条 TCP 消息一个独立 goroutine 入队，N 个 ChatFileData
+// 和尾随的 ChatFileComplete 到达 fileEvents 通道的顺序是无法保证的——
+// 完全可能 Complete 事件排在某些 Data 事件之前被 handleFileEvents 取出。
+// 这里把组装逻辑丢到独立 goroutine 里去等所有分块就位，避免阻塞
+// handleFileEvents 继续处理仍在通道里排队的 ChatFileData 事件。
 func (a *App) handleFileComplete(msg *model.ChatMessage) {
+	go a.finalizeFileReceive(msg.FileID)
+}
+
+func (a *App) finalizeFileReceive(fileID string) {
 	a.fileMu.Lock()
-	rf, ok := a.receivingFiles[msg.FileID]
+	rf, ok := a.receivingFiles[fileID]
+	a.fileMu.Unlock()
 	if !ok {
-		a.fileMu.Unlock()
 		return
 	}
-	delete(a.receivingFiles, msg.FileID)
-	a.fileMu.Unlock()
 
+	// 最长等 30 秒等所有分块就位
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		a.fileMu.Lock()
+		done := len(rf.received) >= rf.chunkTotal
+		a.fileMu.Unlock()
+		if done || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	a.fileMu.Lock()
+	delete(a.receivingFiles, fileID)
 	var fileData []byte
+	missing := -1
 	for i := 0; i < rf.chunkTotal; i++ {
 		chunk, exists := rf.received[i]
 		if !exists {
-			log.Printf("文件块 %d 缺失", i)
-			a.updateStoredTypeByID(rf.storedID, model.ChatFileFailed, "")
-			return
+			missing = i
+			break
 		}
 		fileData = append(fileData, chunk...)
+	}
+	a.fileMu.Unlock()
+
+	sessionID := model.UserKey(rf.fromIP, rf.fromPort)
+	if rf.scope == model.ScopeGroup {
+		sessionID = rf.groupID
+	}
+
+	if missing >= 0 {
+		log.Printf("文件块 %d 缺失（等待 30s 后仍未到齐）", missing)
+		a.updateStoredTypeByID(rf.storedID, model.ChatFileFailed, "")
+		a.refreshChatIfCurrent(sessionID)
+		return
 	}
 
 	destPath := filepath.Join(a.store.FileDir(), fmt.Sprintf("%d_%s", time.Now().Unix(), rf.filename))
 	if err := os.WriteFile(destPath, fileData, 0644); err != nil {
 		log.Printf("写入文件失败: %v", err)
 		a.updateStoredTypeByID(rf.storedID, model.ChatFileFailed, "")
+		a.refreshChatIfCurrent(sessionID)
 		return
 	}
 
 	// 接收方的 ChatFileRequest 消息流转为 ChatFile，Content = 本地路径
 	a.updateStoredTypeByID(rf.storedID, model.ChatFile, destPath)
-
-	sessionID := model.UserKey(rf.fromIP, rf.fromPort)
-	if rf.scope == model.ScopeGroup {
-		sessionID = rf.groupID
-	}
 	a.refreshChatIfCurrent(sessionID)
 	a.scheduleRefreshSidePanel()
 }
@@ -1651,6 +1691,23 @@ func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
 	}
 	return t.base.Size(n)
 }
+
+// chatListTheme 给消息列表用：屏蔽 widget.List 行的选中/悬停背景。
+// 选中态我们已经在 OnSelected 里立即 Unselect，但悬停态需要用颜色覆盖来去掉。
+type chatListTheme struct {
+	base fyne.Theme
+}
+
+func (t *chatListTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	switch n {
+	case theme.ColorNameHover, theme.ColorNameSelection, theme.ColorNameFocus:
+		return color.Transparent
+	}
+	return t.base.Color(n, v)
+}
+func (t *chatListTheme) Font(s fyne.TextStyle) fyne.Resource     { return t.base.Font(s) }
+func (t *chatListTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return t.base.Icon(n) }
+func (t *chatListTheme) Size(n fyne.ThemeSizeName) float32       { return t.base.Size(n) }
 
 // chatInputTheme 专门给底部输入框用：把 primary 强制改成亮红，
 // 这样 Fyne Entry 用 PrimaryColor 画出来的光标就一定能肉眼看到。
@@ -1870,9 +1927,10 @@ func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 	}
 
 	lineH := fyne.MeasureText("国", textSize, fyne.TextStyle{}).Height
-	// widget.Label/Entry 多行渲染每行实际占用 > MeasureText 返回的紧排高度，
-	// 加一点 line-spacing 余量，避免最后一行被气泡裁掉。
-	effLineH := lineH + pad/2
+	// widget.Entry 多行渲染每行实际占用 > MeasureText 返回的紧排高度：
+	// Fyne 内部有 1.2~1.3 的 line-height 因子，外加每行少量 leading。
+	// 不给足就会在 Entry 内部 scroll 里被裁掉最后一行。
+	effLineH := lineH + pad*2
 
 	switch msg.Type {
 	case model.ChatImage:
@@ -1892,9 +1950,13 @@ func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		// 文件卡片内含图标 + 文件名 + 底部一行（meta + 按钮/状态）
-		btnH := lineH + pad*2 // 按钮高度近似
-		h := innerPadV + lineH + btnH + pad*2
+		// 文件卡片内含图标 + VBox(文件名行, 底部 meta+按钮行)。
+		// Fyne Button 自带 InnerPadding 两侧共 16px，实测按钮行 ~34px；
+		// 文件名行 ~22px；VBox 之间再加 pad。外层气泡再留 innerPadV。
+		// 以前按钮行被气泡底边裁掉，这里整体加大 + 额外 pad*2 裕量。
+		nameRowH := lineH + pad*2                        // ~22
+		btnRowH := lineH + theme.InnerPadding()*2 + pad*2 // ~38
+		h := innerPadV + nameRowH + pad + btnRowH + pad*2
 		return w, h
 	default:
 		// 文本：按行测量，超过 maxContentW 则模拟换行（ceil）
@@ -1928,8 +1990,9 @@ func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		// Entry 内部 scroll 上下各留 InnerPadding（默认 8），这里算 *2
-		entryOverhead := theme.InnerPadding() * 2
+		// Entry 内部 scroll 上下各留 InnerPadding（默认 8），再额外多留一行裕量
+		// 避免某些行号下（例如刚好 2 行）Entry 内部 scroll 把最后一行裁走。
+		entryOverhead := theme.InnerPadding()*2 + pad*2
 		h := innerPadV + float32(lines)*effLineH + entryOverhead
 		return w, h
 	}
