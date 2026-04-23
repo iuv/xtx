@@ -407,10 +407,13 @@ func (a *App) buildUI() {
 			fileName := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			fileMeta := canvas.NewText("", theme.Color(theme.ColorNameDisabled))
 			fileMeta.TextSize = theme.TextSize() - 2
-			// 四类按钮/状态，按 msg.Type 动态 Show/Hide
+			// 五类按钮/状态，按 msg.Type 动态 Show/Hide
 			fileOpenBtn := widget.NewButton("打开", nil)
 			fileOpenBtn.Importance = widget.LowImportance
 			fileOpenBtn.Hide()
+			fileSaveBtn := widget.NewButton("另存", nil)
+			fileSaveBtn.Importance = widget.LowImportance
+			fileSaveBtn.Hide()
 			fileAcceptBtn := widget.NewButton("接收", nil)
 			fileAcceptBtn.Importance = widget.HighImportance
 			fileAcceptBtn.Hide()
@@ -419,7 +422,7 @@ func (a *App) buildUI() {
 			fileRejectBtn.Hide()
 			fileStatusLabel := widget.NewLabel("")
 			fileStatusLabel.Hide()
-			fileAction := container.NewHBox(fileStatusLabel, fileRejectBtn, fileAcceptBtn, fileOpenBtn)
+			fileAction := container.NewHBox(fileStatusLabel, fileRejectBtn, fileAcceptBtn, fileSaveBtn, fileOpenBtn)
 			fileBottom := container.NewBorder(nil, nil, fileMeta, fileAction, widget.NewLabel(""))
 			fileRight := container.NewVBox(fileName, fileBottom)
 			fileCard := container.NewBorder(nil, nil, fileIcon, nil, fileRight)
@@ -470,11 +473,12 @@ func (a *App) buildUI() {
 			// fileBottom 是 Border：Objects = [center, left(meta), right(action)]
 			fileMeta := fileBottom.Objects[1].(*canvas.Text)
 			fileAction := fileBottom.Objects[2].(*fyne.Container)
-			// fileAction HBox: [status, reject, accept, open]
+			// fileAction HBox: [status, reject, accept, save, open]
 			fileStatusLabel := fileAction.Objects[0].(*widget.Label)
 			fileRejectBtn := fileAction.Objects[1].(*widget.Button)
 			fileAcceptBtn := fileAction.Objects[2].(*widget.Button)
-			fileOpenBtn := fileAction.Objects[3].(*widget.Button)
+			fileSaveBtn := fileAction.Objects[3].(*widget.Button)
+			fileOpenBtn := fileAction.Objects[4].(*widget.Button)
 
 			// 气泡方向：同机多实例需按 IP+Port 判断
 			isMine := msg.FromIP == localIP && msg.FromPort == localPort
@@ -509,7 +513,7 @@ func (a *App) buildUI() {
 				imgContainer.Hide()
 				fileCard.Show()
 				fileName.SetText(msg.Filename)
-				a.setupFileCard(msg, isMine, fileMeta, fileOpenBtn, fileAcceptBtn, fileRejectBtn, fileStatusLabel)
+				a.setupFileCard(msg, isMine, fileMeta, fileOpenBtn, fileSaveBtn, fileAcceptBtn, fileRejectBtn, fileStatusLabel)
 			default:
 				contentWrap.Show()
 				contentEntry.SetText(msg.Content)
@@ -576,16 +580,13 @@ func (a *App) buildUI() {
 	})
 	chatTitleBar := container.NewHBox(chatTitle, layout.NewSpacer(), searchHistoryBtn)
 
-	// 聊天列表用主题覆盖包一层，把 List 行的悬停/选中底色都改为透明，
-	// 避免鼠标悬停时气泡后面出现灰色高亮。
-	chatHistoryWrap := container.NewThemeOverride(a.chatHistory,
-		&chatListTheme{base: a.fyneApp.Settings().Theme()})
-
+	// List 行的 hover/selection/focus 颜色透明化已在 appTheme 里完成
+	// （listItem 包装层不在 ThemeOverride 的 scope 中，必须在 app 级改）。
 	rightPanel := container.NewBorder(
 		chatTitleBar,
 		inputBar,
 		nil, nil,
-		chatHistoryWrap,
+		a.chatHistory,
 	)
 
 	// --- 主布局 ---
@@ -1587,10 +1588,11 @@ func (a *App) refreshChatIfCurrent(sessionID string) {
 // setupFileCard 根据消息 Type 切换文件卡片的按钮/状态区显示。
 func (a *App) setupFileCard(msg *model.StoredMessage, isMine bool,
 	fileMeta *canvas.Text,
-	fileOpenBtn, fileAcceptBtn, fileRejectBtn *widget.Button,
+	fileOpenBtn, fileSaveBtn, fileAcceptBtn, fileRejectBtn *widget.Button,
 	fileStatusLabel *widget.Label) {
 	// 默认全部隐藏，再按 Type 打开需要的
 	fileOpenBtn.Hide()
+	fileSaveBtn.Hide()
 	fileAcceptBtn.Hide()
 	fileRejectBtn.Hide()
 	fileStatusLabel.Hide()
@@ -1607,7 +1609,13 @@ func (a *App) setupFileCard(msg *model.StoredMessage, isMine bool,
 		fileMeta.Refresh()
 		fileOpenBtn.Show()
 		localPath := msg.Content
+		filename := msg.Filename
 		fileOpenBtn.OnTapped = func() { openPath(localPath) }
+		// 另存仅对接收方显示：发送方 localPath 就是原文件，复制无意义。
+		if !isMine {
+			fileSaveBtn.Show()
+			fileSaveBtn.OnTapped = func() { a.showSaveFileDialog(localPath, filename) }
+		}
 	case model.ChatFileRequest:
 		fileMeta.Text = "文件"
 		fileMeta.Refresh()
@@ -1675,6 +1683,13 @@ func (t *appTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color
 		return inputBgWhite
 	case theme.ColorNamePrimary:
 		return cursorLightGrn
+	case theme.ColorNameHover, theme.ColorNameSelection, theme.ColorNameFocus,
+		theme.ColorNamePressed:
+		// widget.List 的 listItem 包装层不在 ThemeOverride 的 scope 里——
+		// 它拿到的是 theme.Current() 即本 appTheme。所以要在这里把悬停/选中
+		// 的底色直接吃成透明，才能真正消掉消息列表行上的灰色覆盖。
+		// （会顺带影响用户列表：用户没投诉那里有悬停灰，视觉更干净。）
+		return color.Transparent
 	}
 	return t.base.Color(n, v)
 }
@@ -1691,23 +1706,6 @@ func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
 	}
 	return t.base.Size(n)
 }
-
-// chatListTheme 给消息列表用：屏蔽 widget.List 行的选中/悬停背景。
-// 选中态我们已经在 OnSelected 里立即 Unselect，但悬停态需要用颜色覆盖来去掉。
-type chatListTheme struct {
-	base fyne.Theme
-}
-
-func (t *chatListTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
-	switch n {
-	case theme.ColorNameHover, theme.ColorNameSelection, theme.ColorNameFocus:
-		return color.Transparent
-	}
-	return t.base.Color(n, v)
-}
-func (t *chatListTheme) Font(s fyne.TextStyle) fyne.Resource     { return t.base.Font(s) }
-func (t *chatListTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return t.base.Icon(n) }
-func (t *chatListTheme) Size(n fyne.ThemeSizeName) float32       { return t.base.Size(n) }
 
 // chatInputTheme 专门给底部输入框用：把 primary 强制改成亮红，
 // 这样 Fyne Entry 用 PrimaryColor 画出来的光标就一定能肉眼看到。
@@ -1748,6 +1746,13 @@ func (t *bubbleContentTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) c
 		return color.Transparent
 	case theme.ColorNameScrollBar, theme.ColorNameScrollBarBackground:
 		return color.Transparent
+	case theme.ColorNameForeground:
+		// 气泡内正文颜色加深：浅色主题下几乎纯黑，深色主题下用偏亮的浅灰，
+		// 避免默认前景色在浅色气泡里太淡。
+		if v == theme.VariantDark {
+			return color.NRGBA{R: 235, G: 235, B: 235, A: 255}
+		}
+		return color.NRGBA{R: 20, G: 20, B: 20, A: 255}
 	}
 	return t.base.Color(n, v)
 }
@@ -1793,6 +1798,9 @@ type bubbleRowLayout struct {
 const (
 	bubbleMaxRatio = 0.72
 	bubbleMinWidth = 80
+	// messageRowGap 是相邻两条消息之间的垂直间距（px）。行的总高度
+	// = 气泡高度 + messageRowGap，gap 总是放在气泡下方。
+	messageRowGap = 10
 )
 
 func (l *bubbleRowLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
@@ -1830,9 +1838,13 @@ func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	if w > size.Width {
 		w = size.Width
 	}
-	h := l.targetH
+	// 气泡高度 = 行高 - 间距；行尾部那段空白就是和下一条消息的 gap。
+	h := l.targetH - messageRowGap
 	if h <= 0 {
-		h = size.Height
+		h = size.Height - messageRowGap
+		if h < 0 {
+			h = 0
+		}
 	}
 
 	gap := theme.Padding()
@@ -1909,7 +1921,11 @@ func (l *tightBubbleLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 	textSize := theme.TextSize()
 	pad := theme.Padding()
-	innerPadH := pad * 2 // Padded 左右
+	innerPad := theme.InnerPadding()
+	// 文本气泡横向 = Padded(pad*2) + Entry 内部 InnerPadding*2；
+	// 非文本气泡只有 Padded(pad*2)。
+	textHPad := pad*2 + innerPad*2
+	nonTextHPad := pad * 2
 	innerPadV := pad * 2 // Padded 上下
 
 	rowW := a.chatHistory.Size().Width
@@ -1921,26 +1937,25 @@ func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 		}
 	}
 	maxBubbleW := rowW * bubbleMaxRatio
-	maxContentW := maxBubbleW - innerPadH
+	maxContentW := maxBubbleW - textHPad
 	if maxContentW < 80 {
 		maxContentW = 80
 	}
 
 	lineH := fyne.MeasureText("国", textSize, fyne.TextStyle{}).Height
 	// widget.Entry 多行渲染每行实际占用 > MeasureText 返回的紧排高度：
-	// Fyne 内部有 1.2~1.3 的 line-height 因子，外加每行少量 leading。
-	// 不给足就会在 Entry 内部 scroll 里被裁掉最后一行。
+	// Fyne 内部有约 1.2 的 line-height 因子。pad*2 已覆盖。
 	effLineH := lineH + pad*2
 
 	switch msg.Type {
 	case model.ChatImage:
 		// 图片最小 200x150
-		w := float32(200) + innerPadH
+		w := float32(200) + nonTextHPad
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
 		h := innerPadV + 150
-		return w, h
+		return w, h + messageRowGap
 	case model.ChatFile, model.ChatFileRequest, model.ChatFileRejected, model.ChatFileFailed:
 		// 文件卡片：固定偏宽（文件名 + 状态/按钮区）
 		w := maxBubbleW * 0.65
@@ -1953,11 +1968,11 @@ func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 		// 文件卡片内含图标 + VBox(文件名行, 底部 meta+按钮行)。
 		// Fyne Button 自带 InnerPadding 两侧共 16px，实测按钮行 ~34px；
 		// 文件名行 ~22px；VBox 之间再加 pad。外层气泡再留 innerPadV。
-		// 以前按钮行被气泡底边裁掉，这里整体加大 + 额外 pad*2 裕量。
-		nameRowH := lineH + pad*2                        // ~22
-		btnRowH := lineH + theme.InnerPadding()*2 + pad*2 // ~38
+		// 底部额外多留 pad*2 裕量，避免按钮贴下边。
+		nameRowH := lineH + pad*2
+		btnRowH := lineH + innerPad*2 + pad*2
 		h := innerPadV + nameRowH + pad + btnRowH + pad*2
-		return w, h
+		return w, h + messageRowGap
 	default:
 		// 文本：按行测量，超过 maxContentW 则模拟换行（ceil）
 		lines := 0
@@ -1986,15 +2001,17 @@ func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 		if lines == 0 {
 			lines = 1
 		}
-		w := maxLineW + innerPadH
+		// 宽度 = 最长行宽 + 全部水平 padding（含 Entry InnerPadding），
+		// 刚够装下最长行就不会再在 Entry 内被换行。
+		w := maxLineW + textHPad
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		// Entry 内部 scroll 上下各留 InnerPadding（默认 8），再额外多留一行裕量
-		// 避免某些行号下（例如刚好 2 行）Entry 内部 scroll 把最后一行裁走。
-		entryOverhead := theme.InnerPadding()*2 + pad*2
+		// 高度上下对称：Padded 上下各 pad，Entry 上下各 InnerPadding。
+		// 不再额外加 pad*2 裕量，避免底部空出一截。
+		entryOverhead := innerPad * 2
 		h := innerPadV + float32(lines)*effLineH + entryOverhead
-		return w, h
+		return w, h + messageRowGap
 	}
 }
 
@@ -2043,6 +2060,31 @@ func toolbarBgColor(variant fyne.ThemeVariant) color.Color {
 		return color.NRGBA{R: 52, G: 52, B: 55, A: 255}
 	}
 	return color.NRGBA{R: 238, G: 238, B: 242, A: 255}
+}
+
+// showSaveFileDialog 弹出"另存为"对话框，把 srcPath 指向的文件复制到用户选定的位置。
+func (a *App) showSaveFileDialog(srcPath, filename string) {
+	dlg := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, a.window)
+			return
+		}
+		if writer == nil {
+			return
+		}
+		defer writer.Close()
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("读取源文件失败: %v", err), a.window)
+			return
+		}
+		if _, err := writer.Write(data); err != nil {
+			dialog.ShowError(fmt.Errorf("写入文件失败: %v", err), a.window)
+			return
+		}
+	}, a.window)
+	dlg.SetFileName(filename)
+	dlg.Show()
 }
 
 // openPath 用系统默认程序打开文件或目录
