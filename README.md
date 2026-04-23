@@ -110,11 +110,73 @@ xtx/
 
 ### 多架构构建
 
-通过 Makefile 支持交叉编译：
+通过 Makefile 支持交叉编译，目标平台：
 
 - `darwin/amd64`、`darwin/arm64`
 - `linux/amd64`、`linux/arm64`
-- `windows/amd64`、`windows/arm64`
+- `windows/amd64`
+
+> 所有 `make` 命令都要在 `xtx/` 目录里执行，或者在仓库根用 `make -C xtx <target>`。
+> 仓库根没有 Makefile，直接 `make ...` 会报 `No rule to make target`。
+
+#### 1. 本地构建（仅当前平台）
+
+```bash
+make build     # 输出 build/xtx
+make run       # 直接 go run .
+```
+
+#### 2. 交叉编译依赖
+
+交叉编译使用 [fyne-cross](https://github.com/fyne-io/fyne-cross)，需先装好 Docker 并拉取镜像：
+
+```bash
+go install github.com/fyne-io/fyne-cross@latest
+# 确保 $GOPATH/bin 在 PATH 里，然后确认 Docker 可用：
+docker info >/dev/null
+```
+
+#### 3. 全部平台一起编译
+
+```bash
+make cross          # 编译 darwin/linux/windows 全架构，产物在 build/fyne-cross/bin/<platform>/
+make package-all    # 上面的基础上再打包 tar.gz / zip，输出到 build/dist/
+```
+
+#### 4. 只编译指定系统
+
+```bash
+make cross-darwin    # macOS amd64 + arm64
+make cross-linux     # Linux  amd64 + arm64
+make cross-windows   # Windows amd64
+```
+
+产物结构：
+
+```
+build/
+├── fyne-cross/
+│   └── bin/
+│       ├── darwin-amd64/XTX
+│       ├── darwin-arm64/XTX
+│       ├── linux-amd64/XTX
+│       ├── linux-arm64/XTX
+│       └── windows-amd64/XTX.exe
+└── dist/                    # 只有 make package-all 才生成
+    ├── xtx-<ver>-darwin-amd64.tar.gz
+    ├── xtx-<ver>-linux-amd64.tar.gz
+    └── xtx-<ver>-windows-amd64.zip
+```
+
+#### 5. 额外目标
+
+```bash
+make package-app     # 把当前 macOS 版打成带图标的 XTX.app（走 fyne package）
+make clean           # 清空 build/
+make tidy            # go mod tidy
+```
+
+> 注：`make all` 只为**当前主机的 OS/架构**产一份带版本后缀的二进制，不做交叉编译。需要多平台请用 `make cross` / `make package-all`。
 
 ## 界面设计（GUI）
 

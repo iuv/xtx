@@ -1030,12 +1030,19 @@ func (a *App) showCreateGroupDialog() {
 		checks[i] = widget.NewCheck(fmt.Sprintf("%s (%s)", u.Nickname, u.IP), nil)
 		checkContainer.Add(checks[i])
 	}
+	// VScroll 默认 MinSize 非常小，候选人多时列表几乎看不到——给它一个
+	// 合理的最小高度，让弹窗一打开就能看到足够多的候选项（不够则自动滚动）。
+	memberScroll := container.NewVScroll(checkContainer)
+	memberScroll.SetMinSize(fyne.NewSize(360, 300))
 
-	content := container.NewVBox(
-		widget.NewLabel("群名称:"),
-		nameEntry,
-		widget.NewLabel("选择成员:"),
-		container.NewVScroll(checkContainer),
+	content := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabel("群名称:"),
+			nameEntry,
+			widget.NewLabel("选择成员:"),
+		),
+		nil, nil, nil,
+		memberScroll,
 	)
 
 	dlg := dialog.NewCustomConfirm("创建群聊", "创建", "取消", content, func(ok bool) {
@@ -1072,7 +1079,7 @@ func (a *App) showCreateGroupDialog() {
 		a.switchSession(g.ID, model.ScopeGroup, g.Name)
 	}, a.window)
 
-	dlg.Resize(fyne.NewSize(400, 400))
+	dlg.Resize(fyne.NewSize(440, 500))
 	dlg.Show()
 }
 
@@ -1813,22 +1820,23 @@ func (a *App) setupFileCard(msg *model.StoredMessage, isMine bool,
 }
 
 // appTheme 全局主题：在用户选定的基础主题上做若干定制。
-// - 输入框描边为 0、背景纯白，让光标清晰可见；
 // - primary 色改为浅绿（widget.Entry 的光标走 primary），用于排查光标不可见问题；
 // - 分隔线厚度为 0，隐藏 widget.List 条目间灰色横线。
+// 注意：不再全局强制 InputBackground=白。以前强制白色会让暗色主题下
+// 输入框里的文字（Foreground 走基础主题，是浅灰）落在白底上几乎看不见。
+// 现在让输入框背景跟随基础主题，亮/暗两套主题都能获得合适的文字对比度。
 type appTheme struct {
 	base fyne.Theme
 }
 
 var (
 	inputBgWhite    = color.RGBA{R: 255, G: 255, B: 255, A: 255}
-	cursorLightGrn  = color.RGBA{R: 76, G: 175, B: 80, A: 255}  // #4CAF50 偏亮绿，对比纯白
+	inputFgDark     = color.NRGBA{R: 20, G: 20, B: 20, A: 255} // 搭配白底输入框的深色文字
+	cursorLightGrn  = color.RGBA{R: 76, G: 175, B: 80, A: 255} // #4CAF50 偏亮绿，对比纯白
 )
 
 func (t *appTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
 	switch n {
-	case theme.ColorNameInputBackground:
-		return inputBgWhite
 	case theme.ColorNamePrimary:
 		return cursorLightGrn
 	case theme.ColorNameInputBorder:
@@ -1875,6 +1883,10 @@ func (t *chatInputTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color
 		return cursorBrightRed
 	case theme.ColorNameInputBackground:
 		return inputBgWhite
+	case theme.ColorNameForeground:
+		// 输入框底色被强制成白，正文颜色必须一起锁成深色，
+		// 否则暗色主题下基础 Foreground 是浅灰，落在白底上几乎看不见。
+		return inputFgDark
 	}
 	return t.base.Color(n, v)
 }
