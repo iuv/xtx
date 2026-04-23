@@ -210,6 +210,13 @@ func (a *App) Run() {
 	a.window.Show()
 	if a.chatInput != nil {
 		a.window.Canvas().Focus(a.chatInput)
+		// 事件循环跑起来后某些平台会把焦点抢回 List / 窗口本身，
+		// 这里再补一次 Focus 兜底让光标确实出现。
+		time.AfterFunc(300*time.Millisecond, func() {
+			if a.chatInput != nil {
+				a.window.Canvas().Focus(a.chatInput)
+			}
+		})
 	}
 	a.fyneApp.Run()
 }
@@ -376,7 +383,6 @@ func (a *App) buildUI() {
 			return len(s.messages)
 		},
 		func() fyne.CanvasObject {
-			nameLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			// 文本用只读 Entry 展示，可鼠标选中并 Ctrl/Cmd+C 复制。
 			contentEntry := newReadOnlyEntry()
 			// 局部主题：让 Entry 的输入背景透明 + 隐藏滚动条，气泡色透出来。
@@ -421,13 +427,15 @@ func (a *App) buildUI() {
 			// 气泡背景 + 内容
 			bubbleRect := canvas.NewRectangle(color.Transparent)
 			bubbleRect.CornerRadius = 10
-			// 自定义紧凑布局：name 在上，其余（content/img/file，同时只可见一个）占剩余空间，
-			// 这样 WrapWord Entry/Label 会被强制设置成实际高度，避免按 1 行 MinSize 裁切。
-			bubbleContent := container.New(&tightBubbleLayout{}, nameLabel, contentWrap, imgContainer, fileCard)
+			// 气泡内只放三种内容容器（同一时间只有一个可见），tightBubbleLayout 把可见那个铺满。
+			// 气泡外的时间标签由 bubbleRowLayout 统一放置。
+			bubbleContent := container.New(&tightBubbleLayout{}, contentWrap, imgContainer, fileCard)
 			innerBox := container.NewPadded(bubbleContent)
 			bubble := container.NewStack(bubbleRect, innerBox)
+			timeLabel := canvas.NewText("", theme.Color(theme.ColorNameDisabled))
+			timeLabel.TextSize = theme.TextSize() - 2
 			// 每个 row 绑定自己的 bubbleRowLayout 实例，update 时切换 rightAlign
-			return container.New(&bubbleRowLayout{}, bubble)
+			return container.New(&bubbleRowLayout{}, bubble, timeLabel)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			a.mu.Lock()
@@ -444,15 +452,15 @@ func (a *App) buildUI() {
 			row := obj.(*fyne.Container)
 			rowLayout := row.Layout.(*bubbleRowLayout)
 			bubble := row.Objects[0].(*fyne.Container)
+			timeLabel := row.Objects[1].(*canvas.Text)
 
 			bubbleRect := bubble.Objects[0].(*canvas.Rectangle)
 			paddedBox := bubble.Objects[1].(*fyne.Container)
 			vbox := paddedBox.Objects[0].(*fyne.Container)
-			nameLabel := vbox.Objects[0].(*widget.Label)
-			contentWrap := vbox.Objects[1].(*container.ThemeOverride) // 包裹只读 Entry
+			contentWrap := vbox.Objects[0].(*container.ThemeOverride) // 包裹只读 Entry
 			contentEntry := contentWrap.Content.(*readOnlyEntry)
-			imgContainer := vbox.Objects[2].(*fyne.Container)
-			fileCard := vbox.Objects[3].(*fyne.Container)
+			imgContainer := vbox.Objects[1].(*fyne.Container)
+			fileCard := vbox.Objects[2].(*fyne.Container)
 			img := imgContainer.Objects[0].(*canvas.Image)
 			imgTap := imgContainer.Objects[1].(*imageTapper)
 			fileRight := fileCard.Objects[0].(*fyne.Container)
@@ -478,9 +486,9 @@ func (a *App) buildUI() {
 			}
 			bubbleRect.Refresh()
 
-			t := time.Unix(msg.Timestamp, 0).Format("15:04")
-			nameText := fmt.Sprintf("%s  %s", msg.FromNick, t)
-			nameLabel.SetText(nameText)
+			timeLabel.Text = time.Unix(msg.Timestamp, 0).Format("15:04")
+			timeLabel.Color = theme.Color(theme.ColorNameDisabled)
+			timeLabel.Refresh()
 
 			switch msg.Type {
 			case model.ChatImage:
@@ -509,7 +517,7 @@ func (a *App) buildUI() {
 			}
 
 			// 计算气泡目标尺寸，避免 WrapWord 下 MinSize 只返 1 行高导致溢出
-			targetW, targetH := a.measureBubble(msg, nameText)
+			targetW, targetH := a.measureBubble(msg)
 			rowLayout.targetW = targetW
 			rowLayout.targetH = targetH
 			row.Refresh()
@@ -518,6 +526,10 @@ func (a *App) buildUI() {
 			}
 		},
 	)
+	// 消息行不保留选中态：一被 List 选中立即取消，避免出现蓝色高亮背景。
+	a.chatHistory.OnSelected = func(id widget.ListItemID) {
+		a.chatHistory.Unselect(id)
+	}
 
 	// 自定义聊天输入框
 	a.chatInput = newChatEntry(func() { a.sendTextMessage() })
@@ -545,7 +557,11 @@ func (a *App) buildUI() {
 		toolBg,
 		container.NewHBox(fileBtn, imgBtn, emojiBtn, screenshotBtn),
 	)
-	inputRow := container.NewBorder(nil, nil, nil, sendBtn, a.chatInput)
+	// 用单独的主题覆盖包住 chatInput，把光标（primary）强制改成不可能看错的亮红，
+	// 以确认光标是否被绘制出来；同时背景保持纯白，避免任何对比度问题。
+	chatInputWrap := container.NewThemeOverride(a.chatInput,
+		&chatInputTheme{base: a.fyneApp.Settings().Theme()})
+	inputRow := container.NewBorder(nil, nil, nil, sendBtn, chatInputWrap)
 	inputBar := container.NewVBox(toolRow, inputRow)
 
 	chatTitle := widget.NewLabel("选择一个用户或群聊开始聊天")
@@ -1556,14 +1572,36 @@ func (a *App) setupFileCard(msg *model.StoredMessage, isMine bool,
 		fileMeta.Text = "文件"
 		fileMeta.Refresh()
 		fileID := msg.Content
+		// ChatFileRequest 只是初始态，一旦 accept/reject 后实际的传输状态
+		// 由内存中的 fileRequests / receivingFiles 决定。
+		a.fileMu.Lock()
+		_, stillPending := a.fileRequests[fileID]
+		_, receiving := a.receivingFiles[fileID]
+		a.fileMu.Unlock()
 		if isMine {
-			fileStatusLabel.SetText("等待对方接受…")
+			switch {
+			case stillPending:
+				fileStatusLabel.SetText("等待对方接受…")
+			default:
+				// 不在 fileRequests 里了：对方已 accept，正在发送分块
+				fileStatusLabel.SetText("发送中…")
+			}
 			fileStatusLabel.Show()
 		} else {
-			fileAcceptBtn.Show()
-			fileRejectBtn.Show()
-			fileAcceptBtn.OnTapped = func() { a.acceptIncomingFile(fileID) }
-			fileRejectBtn.OnTapped = func() { a.rejectIncomingFile(fileID) }
+			switch {
+			case stillPending:
+				fileAcceptBtn.Show()
+				fileRejectBtn.Show()
+				fileAcceptBtn.OnTapped = func() { a.acceptIncomingFile(fileID) }
+				fileRejectBtn.OnTapped = func() { a.rejectIncomingFile(fileID) }
+			case receiving:
+				fileStatusLabel.SetText("接收中…")
+				fileStatusLabel.Show()
+			default:
+				// 极少数情况：请求已消失但又没进入 receivingFiles
+				fileStatusLabel.SetText("接收中…")
+				fileStatusLabel.Show()
+			}
 		}
 	case model.ChatFileRejected:
 		fileMeta.Text = ""
@@ -1614,6 +1652,30 @@ func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
 	return t.base.Size(n)
 }
 
+// chatInputTheme 专门给底部输入框用：把 primary 强制改成亮红，
+// 这样 Fyne Entry 用 PrimaryColor 画出来的光标就一定能肉眼看到。
+// 除此之外保持基础主题，避免影响全局按钮/控件的高亮色。
+type chatInputTheme struct {
+	base fyne.Theme
+}
+
+var cursorBrightRed = color.NRGBA{R: 255, G: 40, B: 40, A: 255}
+
+func (t *chatInputTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	switch n {
+	case theme.ColorNamePrimary, theme.ColorNameFocus:
+		return cursorBrightRed
+	case theme.ColorNameInputBackground:
+		return inputBgWhite
+	}
+	return t.base.Color(n, v)
+}
+func (t *chatInputTheme) Font(s fyne.TextStyle) fyne.Resource     { return t.base.Font(s) }
+func (t *chatInputTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return t.base.Icon(n) }
+func (t *chatInputTheme) Size(n fyne.ThemeSizeName) float32 {
+	return t.base.Size(n)
+}
+
 // bubbleContentTheme 用于气泡内文本 Entry 的局部主题：
 //   - InputBackground 透明，让气泡底色透出来
 //   - 滚动条透明 + 尺寸为 0，隐藏 Entry 在 Wrap 模式下一定会创建的滚动条
@@ -1656,9 +1718,14 @@ func wrapBaseTheme(setting string) fyne.Theme {
 	return &appTheme{base: base}
 }
 
-// bubbleRowLayout 把单个气泡子节点按左/右对齐放在整行里。
+// bubbleRowLayout 把气泡 + 时间标签按左/右对齐放在整行里。
+// objs[0] = bubble（必需），objs[1] = timeLabel（可选）。
+// 时间标签挂在气泡外侧、底部对齐：
+//   - 发送方（rightAlign=true）气泡靠右，时间贴在气泡左侧底部；
+//   - 接收方气泡靠左，时间贴在气泡右侧底部。
+//
 // update 回调会把 targetW / targetH 填好（通过 fyne.MeasureText 手算），
-// MinSize/Layout 就按目标尺寸走——避免了 widget.Label(WrapWord) MinSize
+// MinSize/Layout 就按目标尺寸走——避免了 WrapWord Entry MinSize
 // 只返 1 行高导致内容溢出的问题。
 type bubbleRowLayout struct {
 	rightAlign bool
@@ -1687,6 +1754,11 @@ func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 		return
 	}
 	bubble := objs[0]
+	var timeLabel fyne.CanvasObject
+	if len(objs) > 1 {
+		timeLabel = objs[1]
+	}
+
 	w := l.targetW
 	if w <= 0 {
 		w = bubble.MinSize().Width
@@ -1705,82 +1777,83 @@ func (l *bubbleRowLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	if h <= 0 {
 		h = size.Height
 	}
-	var x float32
-	if l.rightAlign {
-		x = size.Width - w
+
+	gap := theme.Padding()
+	var timeW, timeH float32
+	if timeLabel != nil {
+		ms := timeLabel.MinSize()
+		timeW, timeH = ms.Width, ms.Height
 	}
-	bubble.Move(fyne.NewPos(x, 0))
-	bubble.Resize(fyne.NewSize(w, h))
+
+	if l.rightAlign {
+		bubbleX := size.Width - w
+		bubble.Move(fyne.NewPos(bubbleX, 0))
+		bubble.Resize(fyne.NewSize(w, h))
+		if timeLabel != nil {
+			tx := bubbleX - gap - timeW
+			if tx < 0 {
+				tx = 0
+			}
+			ty := h - timeH
+			if ty < 0 {
+				ty = 0
+			}
+			timeLabel.Move(fyne.NewPos(tx, ty))
+			timeLabel.Resize(fyne.NewSize(timeW, timeH))
+		}
+	} else {
+		bubble.Move(fyne.NewPos(0, 0))
+		bubble.Resize(fyne.NewSize(w, h))
+		if timeLabel != nil {
+			tx := w + gap
+			ty := h - timeH
+			if ty < 0 {
+				ty = 0
+			}
+			timeLabel.Move(fyne.NewPos(tx, ty))
+			timeLabel.Resize(fyne.NewSize(timeW, timeH))
+		}
+	}
 }
 
-// tightBubbleLayout 紧凑气泡内容布局：
-//   - objs[0] 为 name 标签，固定按 MinSize 高度贴顶放置；
-//   - 其余 objs 视为"内容区"（文本 / 图片容器 / 文件卡片，同一时间只有一个可见），
-//     紧接 name 之下，填满容器剩余高度，强制 WrapWord 文本展开到目标高度。
+// tightBubbleLayout 紧凑气泡内容布局：气泡内同一时间只可见一个对象
+// （文本 Entry / 图片容器 / 文件卡片），把它铺满整个气泡内部。
 //
-// 与 container.NewVBox 的区别：VBox 在子项间插入整 pad 间距，且按子 MinSize 分配高度，
-// 导致 WrapWord Label 只被给 1 行高、最后一行超出气泡。
+// 与 container.NewStack 的区别：这里只会为可见对象返回 MinSize，
+// 避免被隐藏的文件卡片抬高气泡高度。
 type tightBubbleLayout struct{}
 
-// nameContentGap name 与 content 之间的纵向间距（pad 的一半）。
-func tightNameGap() float32 { return theme.Padding() / 2 }
-
 func (l *tightBubbleLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
-	if len(objs) == 0 {
-		return fyne.NewSize(0, 0)
-	}
-	var maxW, h float32
-	name := objs[0]
-	nameMS := name.MinSize()
-	h = nameMS.Height
-	maxW = nameMS.Width
-	for _, o := range objs[1:] {
+	for _, o := range objs {
 		if !o.Visible() {
 			continue
 		}
-		ms := o.MinSize()
-		if ms.Width > maxW {
-			maxW = ms.Width
-		}
-		h += tightNameGap() + ms.Height
-		break // 只会有一个可见
+		return o.MinSize()
 	}
-	return fyne.NewSize(maxW, h)
+	return fyne.NewSize(0, 0)
 }
 
 func (l *tightBubbleLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
-	if len(objs) == 0 {
-		return
-	}
-	name := objs[0]
-	nameH := name.MinSize().Height
-	name.Move(fyne.NewPos(0, 0))
-	name.Resize(fyne.NewSize(size.Width, nameH))
-	y := nameH + tightNameGap()
-	remainH := size.Height - y
-	if remainH < 0 {
-		remainH = 0
-	}
-	for _, o := range objs[1:] {
+	for _, o := range objs {
 		if !o.Visible() {
 			continue
 		}
-		o.Move(fyne.NewPos(0, y))
-		o.Resize(fyne.NewSize(size.Width, remainH))
+		o.Move(fyne.NewPos(0, 0))
+		o.Resize(size)
+		return
 	}
 }
 
 // measureBubble 估算单条消息气泡的目标宽高。
 // 返回 (w, h)，任一为 0 时表示该维度回退到气泡自身 MinSize。
 //
-// 气泡层级：Stack(矩形) → Padded(pad 四周) → tightBubbleLayout(name + 内容)。
-// 所以横向内边距 = pad*2，纵向内边距 = pad*2，name 与内容之间 = pad/2。
-func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32, float32) {
+// 气泡层级：Stack(矩形) → Padded(pad 四周) → tightBubbleLayout(单一内容)。
+// 横向内边距 = pad*2，纵向内边距 = pad*2。
+func (a *App) measureBubble(msg *model.StoredMessage) (float32, float32) {
 	textSize := theme.TextSize()
 	pad := theme.Padding()
 	innerPadH := pad * 2 // Padded 左右
 	innerPadV := pad * 2 // Padded 上下
-	nameGap := pad / 2   // name 与内容之间
 
 	rowW := a.chatHistory.Size().Width
 	if rowW < 100 {
@@ -1796,24 +1869,19 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		maxContentW = 80
 	}
 
-	nameSize := fyne.MeasureText(nameText, textSize, fyne.TextStyle{Bold: true})
 	lineH := fyne.MeasureText("国", textSize, fyne.TextStyle{}).Height
-	// widget.Label 多行渲染每行实际占用 > MeasureText 返回的紧排高度，
+	// widget.Label/Entry 多行渲染每行实际占用 > MeasureText 返回的紧排高度，
 	// 加一点 line-spacing 余量，避免最后一行被气泡裁掉。
 	effLineH := lineH + pad/2
 
 	switch msg.Type {
 	case model.ChatImage:
 		// 图片最小 200x150
-		contentW := float32(200)
-		if nameSize.Width > contentW {
-			contentW = nameSize.Width
-		}
-		w := contentW + innerPadH
+		w := float32(200) + innerPadH
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		h := innerPadV + nameSize.Height + nameGap + 150
+		h := innerPadV + 150
 		return w, h
 	case model.ChatFile, model.ChatFileRequest, model.ChatFileRejected, model.ChatFileFailed:
 		// 文件卡片：固定偏宽（文件名 + 状态/按钮区）
@@ -1824,9 +1892,9 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		// 文件卡片内含图标 + 文件名 + 底部一行（meta + 按钮/状态），大约 2 行文本 + 按钮高度
+		// 文件卡片内含图标 + 文件名 + 底部一行（meta + 按钮/状态）
 		btnH := lineH + pad*2 // 按钮高度近似
-		h := innerPadV + nameSize.Height + nameGap + lineH + btnH + pad
+		h := innerPadV + lineH + btnH + pad*2
 		return w, h
 	default:
 		// 文本：按行测量，超过 maxContentW 则模拟换行（ceil）
@@ -1856,17 +1924,13 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		if lines == 0 {
 			lines = 1
 		}
-		contentW := maxLineW
-		if contentW < nameSize.Width {
-			contentW = nameSize.Width
-		}
-		w := contentW + innerPadH
+		w := maxLineW + innerPadH
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
 		// Entry 内部 scroll 上下各留 InnerPadding（默认 8），这里算 *2
 		entryOverhead := theme.InnerPadding() * 2
-		h := innerPadV + nameSize.Height + nameGap + float32(lines)*effLineH + entryOverhead
+		h := innerPadV + float32(lines)*effLineH + entryOverhead
 		return w, h
 	}
 }
