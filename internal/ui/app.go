@@ -57,8 +57,9 @@ type App struct {
 	chatHistory    *widget.List
 	chatInput      *chatEntry
 	chatTitleLabel *widget.Label
-	selfInfoLabel  *widget.Label // 左侧底部"当前用户"信息
-	sessionKeys    []string      // 有序的会话key列表
+	manageGroupBtn *widget.Button // 右上角"管理"按钮，只在群聊会话显示
+	selfInfoLabel  *widget.Label  // 左侧底部"当前用户"信息
+	sessionKeys    []string       // 有序的会话key列表
 
 	// 截图快捷键
 	screenshotShortcut *desktop.CustomShortcut
@@ -159,10 +160,13 @@ func New(disc *discovery.Service, chatSvc *chat.Service, store *db.DB) *App {
 	return a
 }
 
-// SetIcon 设置应用图标（需在 Run 之前调用）
+// SetIcon 设置应用图标（需在 Run 之前调用）。
+// 必须是 PNG：部分平台的任务栏/状态栏图标要求带透明通道，JPEG 没有透明
+// 会被画成方框。资源名里的扩展名也参与某些平台的 MIME 识别。
 func (a *App) SetIcon(data []byte) {
-	icon := fyne.NewStaticResource("logo.jpeg", data)
+	icon := fyne.NewStaticResource("logo.png", data)
 	a.fyneApp.SetIcon(icon)
+	a.window.SetIcon(icon)
 }
 
 // Run 启动应用
@@ -578,7 +582,19 @@ func (a *App) buildUI() {
 	searchHistoryBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {
 		a.showSearchDialog()
 	})
-	chatTitleBar := container.NewHBox(chatTitle, layout.NewSpacer(), searchHistoryBtn)
+	manageGroupBtn := widget.NewButtonWithIcon("管理", theme.SettingsIcon(), func() {
+		a.mu.Lock()
+		sid := a.currentSID
+		s := a.sessions[sid]
+		a.mu.Unlock()
+		if s == nil || s.scope != model.ScopeGroup {
+			return
+		}
+		a.showManageGroupDialog(sid)
+	})
+	manageGroupBtn.Hide()
+	a.manageGroupBtn = manageGroupBtn
+	chatTitleBar := container.NewHBox(chatTitle, layout.NewSpacer(), manageGroupBtn, searchHistoryBtn)
 
 	// List 行的 hover/selection/focus 颜色透明化已在 appTheme 里完成
 	// （listItem 包装层不在 ThemeOverride 的 scope 中，必须在 app 级改）。
@@ -816,6 +832,13 @@ func (a *App) switchSession(id, scope, label string) {
 	a.mu.Unlock()
 
 	a.chatTitleLabel.SetText(fmt.Sprintf("与 %s 的对话", label))
+	if a.manageGroupBtn != nil {
+		if scope == model.ScopeGroup {
+			a.manageGroupBtn.Show()
+		} else {
+			a.manageGroupBtn.Hide()
+		}
+	}
 	a.chatHistory.Refresh()
 	if len(s.messages) > 0 {
 		a.chatHistory.ScrollToBottom()
@@ -1050,6 +1073,131 @@ func (a *App) showCreateGroupDialog() {
 	}, a.window)
 
 	dlg.Resize(fyne.NewSize(400, 400))
+	dlg.Show()
+}
+
+// showManageGroupDialog 管理群聊：修改名称、移除现有成员、添加在线新成员。
+// 任一成员都可以编辑——P2P 场景下改动通过 BroadcastGroupUpdate 最终一致。
+func (a *App) showManageGroupDialog(groupID string) {
+	g := a.discovery.GetGroup(groupID)
+	if g == nil {
+		dialog.ShowInformation("提示", "群聊不存在", a.window)
+		return
+	}
+
+	selfIP := a.discovery.LocalIP()
+	memberSet := make(map[string]bool, len(g.Members))
+	for _, ip := range g.Members {
+		memberSet[ip] = true
+	}
+
+	nameEntry := widget.NewEntry()
+	nameEntry.SetText(g.Name)
+
+	// 现有成员：每行一个 "移除" 勾选框；自己不能移除。
+	type memberRow struct {
+		ip    string
+		check *widget.Check // nil 表示自己
+	}
+	var memberRows []memberRow
+	membersBox := container.NewVBox()
+	for _, ip := range g.Members {
+		var label string
+		if u := a.discovery.GetUserByIP(ip); u != nil {
+			label = fmt.Sprintf("%s (%s)", u.Nickname, ip)
+		} else {
+			label = ip
+		}
+		if ip == selfIP {
+			membersBox.Add(widget.NewLabel(label + "  — 本人"))
+			memberRows = append(memberRows, memberRow{ip: ip, check: nil})
+			continue
+		}
+		chk := widget.NewCheck("移除 "+label, nil)
+		membersBox.Add(chk)
+		memberRows = append(memberRows, memberRow{ip: ip, check: chk})
+	}
+
+	// 候选新成员：在线、非成员。
+	var candidateIPs []string
+	var candidateChecks []*widget.Check
+	candidateBox := container.NewVBox()
+	for _, u := range a.discovery.GetUsers() {
+		if !u.Online || memberSet[u.IP] {
+			continue
+		}
+		chk := widget.NewCheck(fmt.Sprintf("%s (%s)", u.Nickname, u.IP), nil)
+		candidateBox.Add(chk)
+		candidateIPs = append(candidateIPs, u.IP)
+		candidateChecks = append(candidateChecks, chk)
+	}
+	if len(candidateIPs) == 0 {
+		candidateBox.Add(widget.NewLabel("（无可添加的在线用户）"))
+	}
+
+	scroll := container.NewVScroll(container.NewVBox(
+		widget.NewLabel("当前成员："),
+		membersBox,
+		widget.NewSeparator(),
+		widget.NewLabel("添加成员："),
+		candidateBox,
+	))
+	scroll.SetMinSize(fyne.NewSize(360, 260))
+
+	content := container.NewBorder(
+		container.NewVBox(widget.NewLabel("群名称:"), nameEntry),
+		nil, nil, nil,
+		scroll,
+	)
+
+	dlg := dialog.NewCustomConfirm("管理群聊", "保存", "取消", content, func(ok bool) {
+		if !ok {
+			return
+		}
+		newName := strings.TrimSpace(nameEntry.Text)
+		if newName == "" {
+			newName = g.Name
+		}
+		// 计算新成员列表：保留未被勾选移除的，加上勾选添加的。
+		newMembers := make([]string, 0, len(memberRows)+len(candidateIPs))
+		for _, r := range memberRows {
+			if r.check != nil && r.check.Checked {
+				continue // 移除
+			}
+			newMembers = append(newMembers, r.ip)
+		}
+		for i, chk := range candidateChecks {
+			if chk.Checked {
+				newMembers = append(newMembers, candidateIPs[i])
+			}
+		}
+		if len(newMembers) < 2 {
+			dialog.ShowInformation("提示", "群聊至少需要 2 个成员", a.window)
+			return
+		}
+
+		updated := &model.Group{
+			ID:        g.ID,
+			Name:      newName,
+			Members:   newMembers,
+			CreatorIP: g.CreatorIP,
+		}
+		a.discovery.AddGroup(updated) // 覆盖本地
+		_ = a.store.SaveGroup(updated)
+		a.discovery.BroadcastGroupUpdate(updated)
+		a.refreshSidePanel()
+		// 标题同步更新
+		a.mu.Lock()
+		if s, ok := a.sessions[groupID]; ok {
+			s.label = newName
+		}
+		isCurrent := a.currentSID == groupID
+		a.mu.Unlock()
+		if isCurrent {
+			a.chatTitleLabel.SetText(fmt.Sprintf("与 %s 的对话", newName))
+		}
+	}, a.window)
+	dlg.Resize(fyne.NewSize(440, 460))
 	dlg.Show()
 }
 
@@ -1683,6 +1831,12 @@ func (t *appTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color
 		return inputBgWhite
 	case theme.ColorNamePrimary:
 		return cursorLightGrn
+	case theme.ColorNameInputBorder:
+		// 未聚焦输入框描边透明；聚焦态用的是 ColorNamePrimary，这里不管。
+		// 以前是把 SizeNameInputBorder 设为 0 来消描边，但那个 size 同时
+		// 决定 Entry 光标的宽度（entry.go:1898 cursor.Resize(inputBorder, h)），
+		// 宽度为 0 的光标自然不可见。用透明色代替，保留默认的 1px 尺寸。
+		return color.Transparent
 	case theme.ColorNameHover, theme.ColorNameSelection, theme.ColorNameFocus,
 		theme.ColorNamePressed:
 		// widget.List 的 listItem 包装层不在 ThemeOverride 的 scope 里——
@@ -1699,11 +1853,10 @@ func (t *appTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
 }
 func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
 	switch n {
-	case theme.SizeNameInputBorder:
-		return 0
 	case theme.SizeNameSeparatorThickness:
 		return 0
 	}
+	// 刻意不再把 SizeNameInputBorder 归 0：光标宽度依赖这个 size。
 	return t.base.Size(n)
 }
 

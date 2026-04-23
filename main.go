@@ -16,7 +16,7 @@ import (
 	"github.com/ixx/xtx/internal/ui"
 )
 
-//go:embed logo.jpeg
+//go:embed logo.png
 var logoData []byte
 
 func main() {
