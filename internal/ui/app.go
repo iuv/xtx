@@ -414,8 +414,8 @@ func (a *App) buildUI() {
 			paddedBox := bubble.Objects[1].(*fyne.Container)
 			vbox := paddedBox.Objects[0].(*fyne.Container)
 			nameLabel := vbox.Objects[0].(*widget.Label)
-			contentWrap := vbox.Objects[1].(*fyne.Container) // ThemeOverride 包裹只读 Entry
-			contentEntry := contentWrap.Objects[0].(*readOnlyEntry)
+			contentWrap := vbox.Objects[1].(*container.ThemeOverride) // 包裹只读 Entry
+			contentEntry := contentWrap.Content.(*readOnlyEntry)
 			imgContainer := vbox.Objects[2].(*fyne.Container)
 			fileCard := vbox.Objects[3].(*fyne.Container)
 			img := imgContainer.Objects[0].(*canvas.Image)
