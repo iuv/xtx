@@ -74,9 +74,9 @@ type App struct {
 	filteredItems []sideItem // 过滤后的列表
 
 	// 文件传输状态
-	pendingFiles map[string]string // fileID -> 本地文件路径（待发送）
-	receivingFiles map[string]*receivingFile // fileID -> 接收中的文件
-	fileMu       sync.Mutex
+	receivingFiles map[string]*receivingFile    // fileID -> 已 accept 正在接收
+	fileRequests   map[string]*fileRequestState // fileID -> 待确认的请求（未 accept/reject/timeout）
+	fileMu         sync.Mutex
 
 	// 侧边栏刷新防抖：合并 100ms 内的多次事件触发的刷新
 	refreshMu    sync.Mutex
@@ -98,7 +98,32 @@ type receivingFile struct {
 	fromNick   string
 	scope      string
 	groupID    string
+	storedID   int64 // 对应的 StoredMessage ID，完成时更新
 }
+
+// fileRequestState 跟踪一次"待确认"的文件请求（发送方与接收方各一份）。
+// 在存储表里对应一条 Type=ChatFileRequest 的消息，所有状态流转都通过
+// storedMsg 指针就地修改并回写 DB。
+type fileRequestState struct {
+	fileID    string
+	storedMsg *model.StoredMessage // 指向 session.messages 里的那条
+	sessionID string
+	timer     *time.Timer
+
+	// 发送方专用
+	localPath string
+	toKey     string // 目标 UserKey（单聊用）
+	scope     string
+	groupID   string
+
+	// 接收方专用
+	fromIP   string
+	fromPort int
+	fromNick string
+	fileSize int64
+}
+
+const fileRequestTimeout = 5 * time.Minute
 
 type sideItem struct {
 	label    string // 仅用于搜索匹配
@@ -120,8 +145,8 @@ func New(disc *discovery.Service, chatSvc *chat.Service, store *db.DB) *App {
 		chatSvc:        chatSvc,
 		store:          store,
 		sessions:       make(map[string]*session),
-		pendingFiles:   make(map[string]string),
 		receivingFiles: make(map[string]*receivingFile),
+		fileRequests:   make(map[string]*fileRequestState),
 		unreadCounts:   make(map[string]int),
 	}
 
@@ -354,31 +379,41 @@ func (a *App) buildUI() {
 			nameLabel := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			// 文本用只读 Entry 展示，可鼠标选中并 Ctrl/Cmd+C 复制。
 			contentEntry := newReadOnlyEntry()
-			// 局部主题：让 Entry 的输入背景透明，气泡色透出来。
+			// 局部主题：让 Entry 的输入背景透明 + 隐藏滚动条，气泡色透出来。
 			contentWrap := container.NewThemeOverride(
 				contentEntry,
 				&bubbleContentTheme{base: a.fyneApp.Settings().Theme()},
 			)
 
-			// 图片气泡
+			// 图片气泡：透明 imageTapper 捕获点击，不画悬停灰色 overlay
 			img := canvas.NewImageFromResource(nil)
 			img.SetMinSize(fyne.NewSize(200, 150))
 			img.FillMode = canvas.ImageFillContain
 			img.Hidden = true
-			imgBtn := widget.NewButton("", nil)
-			imgBtn.Importance = widget.LowImportance
-			imgBtn.Hidden = true
-			imgContainer := container.NewStack(img, imgBtn)
+			imgTap := newImageTapper()
+			imgTap.Hide()
+			imgContainer := container.NewStack(img, imgTap)
 			imgContainer.Hidden = true
 
-			// 文件卡片：图标 + 文件名 + 大小 + 打开按钮
+			// 文件卡片：图标 + 文件名 + 底部（meta + 动态按钮/状态区）
 			fileIcon := widget.NewIcon(theme.FileIcon())
 			fileName := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			fileMeta := canvas.NewText("", theme.Color(theme.ColorNameDisabled))
 			fileMeta.TextSize = theme.TextSize() - 2
+			// 四类按钮/状态，按 msg.Type 动态 Show/Hide
 			fileOpenBtn := widget.NewButton("打开", nil)
 			fileOpenBtn.Importance = widget.LowImportance
-			fileBottom := container.NewBorder(nil, nil, fileMeta, fileOpenBtn, widget.NewLabel(""))
+			fileOpenBtn.Hide()
+			fileAcceptBtn := widget.NewButton("接收", nil)
+			fileAcceptBtn.Importance = widget.HighImportance
+			fileAcceptBtn.Hide()
+			fileRejectBtn := widget.NewButton("拒绝", nil)
+			fileRejectBtn.Importance = widget.LowImportance
+			fileRejectBtn.Hide()
+			fileStatusLabel := widget.NewLabel("")
+			fileStatusLabel.Hide()
+			fileAction := container.NewHBox(fileStatusLabel, fileRejectBtn, fileAcceptBtn, fileOpenBtn)
+			fileBottom := container.NewBorder(nil, nil, fileMeta, fileAction, widget.NewLabel(""))
 			fileRight := container.NewVBox(fileName, fileBottom)
 			fileCard := container.NewBorder(nil, nil, fileIcon, nil, fileRight)
 			fileCard.Hidden = true
@@ -419,13 +454,18 @@ func (a *App) buildUI() {
 			imgContainer := vbox.Objects[2].(*fyne.Container)
 			fileCard := vbox.Objects[3].(*fyne.Container)
 			img := imgContainer.Objects[0].(*canvas.Image)
-			imgBtn := imgContainer.Objects[1].(*widget.Button)
+			imgTap := imgContainer.Objects[1].(*imageTapper)
 			fileRight := fileCard.Objects[0].(*fyne.Container)
 			fileName := fileRight.Objects[0].(*widget.Label)
 			fileBottom := fileRight.Objects[1].(*fyne.Container)
-			// fileBottom 是 Border：Objects = [center, left(meta), right(btn)]
+			// fileBottom 是 Border：Objects = [center, left(meta), right(action)]
 			fileMeta := fileBottom.Objects[1].(*canvas.Text)
-			fileOpenBtn := fileBottom.Objects[2].(*widget.Button)
+			fileAction := fileBottom.Objects[2].(*fyne.Container)
+			// fileAction HBox: [status, reject, accept, open]
+			fileStatusLabel := fileAction.Objects[0].(*widget.Label)
+			fileRejectBtn := fileAction.Objects[1].(*widget.Button)
+			fileAcceptBtn := fileAction.Objects[2].(*widget.Button)
+			fileOpenBtn := fileAction.Objects[3].(*widget.Button)
 
 			// 气泡方向：同机多实例需按 IP+Port 判断
 			isMine := msg.FromIP == localIP && msg.FromPort == localPort
@@ -447,30 +487,20 @@ func (a *App) buildUI() {
 				contentWrap.Hide()
 				imgContainer.Show()
 				img.Show()
-				imgBtn.Show()
+				imgTap.Show()
 				fileCard.Hide()
 				if msg.Content != "" {
 					img.File = msg.Content
 					img.Refresh()
 				}
 				imgPath := msg.Content
-				imgBtn.OnTapped = func() {
-					a.showFullImage(imgPath)
-				}
-			case model.ChatFile:
+				imgTap.onTapped = func() { a.showFullImage(imgPath) }
+			case model.ChatFile, model.ChatFileRequest, model.ChatFileRejected, model.ChatFileFailed:
 				contentWrap.Hide()
 				imgContainer.Hide()
 				fileCard.Show()
 				fileName.SetText(msg.Filename)
-				meta := "文件"
-				if fi, err := os.Stat(msg.Content); err == nil {
-					meta = formatFileSize(fi.Size())
-				}
-				fileMeta.Text = meta
-				fileMeta.Color = theme.Color(theme.ColorNameDisabled)
-				fileMeta.Refresh()
-				localPath := msg.Content
-				fileOpenBtn.OnTapped = func() { openPath(localPath) }
+				a.setupFileCard(msg, isMine, fileMeta, fileOpenBtn, fileAcceptBtn, fileRejectBtn, fileStatusLabel)
 			default:
 				contentWrap.Show()
 				contentEntry.SetText(msg.Content)
@@ -509,7 +539,12 @@ func (a *App) buildUI() {
 	emojiBtn.Importance = widget.LowImportance
 	screenshotBtn := widget.NewButtonWithIcon("", theme.ContentCutIcon(), func() { a.startScreenshot() })
 
-	toolRow := container.NewHBox(fileBtn, imgBtn, emojiBtn, screenshotBtn)
+	// 工具栏加一层背景矩形，做成"聊天区与输入框之间的条带"
+	toolBg := canvas.NewRectangle(toolbarBgColor(a.fyneApp.Settings().ThemeVariant()))
+	toolRow := container.NewStack(
+		toolBg,
+		container.NewHBox(fileBtn, imgBtn, emojiBtn, screenshotBtn),
+	)
 	inputRow := container.NewBorder(nil, nil, nil, sendBtn, a.chatInput)
 	inputBar := container.NewVBox(toolRow, inputRow)
 
@@ -1014,6 +1049,8 @@ func readAll(r fyne.URIReadCloser) ([]byte, error) {
 
 const fileChunkSize = 512 * 1024 // 512KB per chunk
 
+// sendFileRequest 发起文件请求：选择文件后在自己聊天里显示一条"等待对方接受…"
+// 的卡片，同时通过 TCP 发送 ChatFileRequest 给对方；5 分钟未收到接受就标为传输失败。
 func (a *App) sendFileRequest() {
 	a.mu.Lock()
 	s := a.sessions[a.currentSID]
@@ -1037,12 +1074,50 @@ func (a *App) sendFileRequest() {
 
 		fileID := uuid.New().String()
 		filename := filepath.Base(filePath)
+		now := time.Now().Unix()
 
+		// 1) 本地存一条 ChatFileRequest：Content 放 fileID，Filename 放文件名
+		stored := &model.StoredMessage{
+			SessionID: s.id,
+			Scope:     s.scope,
+			FromNick:  a.discovery.Nickname(),
+			FromIP:    a.discovery.LocalIP(),
+			FromPort:  a.discovery.TCPPort(),
+			Type:      model.ChatFileRequest,
+			Content:   fileID,
+			Filename:  filename,
+			Timestamp: now,
+		}
+		if err := a.store.SaveMessage(stored); err != nil {
+			dialog.ShowError(fmt.Errorf("保存文件记录失败: %v", err), a.window)
+			return
+		}
+
+		a.mu.Lock()
+		s.messages = append(s.messages, stored)
+		a.mu.Unlock()
+
+		// 2) 登记请求状态（发送方）
+		state := &fileRequestState{
+			fileID:    fileID,
+			storedMsg: stored,
+			sessionID: s.id,
+			localPath: filePath,
+			toKey:     s.id, // 单聊 s.id 就是对端 UserKey
+			scope:     s.scope,
+			groupID:   "",
+		}
+		if s.scope == model.ScopeGroup {
+			state.groupID = s.id
+		}
 		a.fileMu.Lock()
-		a.pendingFiles[fileID] = filePath
+		a.fileRequests[fileID] = state
 		a.fileMu.Unlock()
 
-		now := time.Now().Unix()
+		// 3) 5 分钟超时
+		state.timer = time.AfterFunc(fileRequestTimeout, func() { a.fileRequestTimeout(fileID) })
+
+		// 4) 发出去
 		chatMsg := &model.ChatMessage{
 			Type:      model.ChatFileRequest,
 			Scope:     s.scope,
@@ -1058,15 +1133,14 @@ func (a *App) sendFileRequest() {
 		if s.scope == model.ScopeGroup {
 			chatMsg.GroupID = s.id
 		}
-
 		if err := a.doSend(s, chatMsg); err != nil {
 			dialog.ShowError(fmt.Errorf("发送文件请求失败: %v", err), a.window)
-			a.fileMu.Lock()
-			delete(a.pendingFiles, fileID)
-			a.fileMu.Unlock()
+			a.cancelFileRequest(fileID, model.ChatFileFailed)
 			return
 		}
+
 		a.clearUnread(s.id)
+		a.refreshChatIfCurrent(s.id)
 	}, a.window)
 	dlg.Show()
 }
@@ -1089,83 +1163,213 @@ func (a *App) handleFileEvents() {
 	}
 }
 
+// handleFileRequest 接收方：不再弹窗，直接在聊天里显示一条卡片，
+// 点击"接收"才开始传输；5 分钟没确认则标为传输失败。
 func (a *App) handleFileRequest(msg *model.ChatMessage) {
-	sizeStr := formatFileSize(msg.FileSize)
-	title := fmt.Sprintf("%s 想发送文件", msg.From)
-	text := fmt.Sprintf("%s (%s)，是否接受？", msg.Filename, sizeStr)
+	var sessionID string
+	if msg.Scope == model.ScopeGroup {
+		sessionID = msg.GroupID
+	} else {
+		sessionID = model.UserKey(msg.FromIP, msg.FromPort)
+	}
 
-	dialog.ShowConfirm(title, text, func(accept bool) {
-		reply := &model.ChatMessage{
-			Scope:     msg.Scope,
-			GroupID:   msg.GroupID,
-			From:      a.discovery.Nickname(),
-			FromIP:    a.discovery.LocalIP(),
-			FromPort:  a.discovery.TCPPort(),
-			Timestamp: time.Now().Unix(),
-			FileID:    msg.FileID,
-			Filename:  msg.Filename,
-		}
-
-		if accept {
-			reply.Type = model.ChatFileAccept
-			// 准备接收
-			a.fileMu.Lock()
-			chunkTotal := int(msg.FileSize / fileChunkSize)
-			if msg.FileSize%fileChunkSize != 0 {
-				chunkTotal++
-			}
-			a.receivingFiles[msg.FileID] = &receivingFile{
-				filename:   msg.Filename,
-				fileSize:   msg.FileSize,
-				chunkTotal: chunkTotal,
-				received:   make(map[int][]byte),
-				fromIP:     msg.FromIP,
-				fromPort:   msg.FromPort,
-				fromNick:   msg.From,
-				scope:      msg.Scope,
-				groupID:    msg.GroupID,
-			}
-			a.fileMu.Unlock()
-		} else {
-			reply.Type = model.ChatFileReject
-		}
-
-		user := a.discovery.GetUserByKey(model.UserKey(msg.FromIP, msg.FromPort))
-		if user != nil {
-			_ = a.chatSvc.SendMessage(user.IP, user.TCPPort, reply)
-		}
-	}, a.window)
-}
-
-func (a *App) handleFileAccept(msg *model.ChatMessage) {
-	a.fileMu.Lock()
-	filePath, ok := a.pendingFiles[msg.FileID]
-	a.fileMu.Unlock()
-	if !ok {
+	stored := &model.StoredMessage{
+		SessionID: sessionID,
+		Scope:     msg.Scope,
+		FromNick:  msg.From,
+		FromIP:    msg.FromIP,
+		FromPort:  msg.FromPort,
+		Type:      model.ChatFileRequest,
+		Content:   msg.FileID,
+		Filename:  msg.Filename,
+		Timestamp: msg.Timestamp,
+	}
+	if err := a.store.SaveMessage(stored); err != nil {
+		log.Printf("保存文件请求失败: %v", err)
 		return
 	}
 
-	go a.sendFileChunks(model.UserKey(msg.FromIP, msg.FromPort), msg.FileID, filePath, msg.Scope, msg.GroupID)
+	a.mu.Lock()
+	s, ok := a.sessions[sessionID]
+	if !ok {
+		label := msg.From
+		if msg.Scope == model.ScopeGroup {
+			if g := a.discovery.GetGroup(msg.GroupID); g != nil {
+				label = g.Name
+			}
+		}
+		s = &session{id: sessionID, scope: msg.Scope, label: label}
+		a.sessions[sessionID] = s
+	}
+	s.messages = append(s.messages, stored)
+	isCurrent := a.currentSID == sessionID
+	if !isCurrent || !a.windowFocused {
+		a.unreadCounts[sessionID]++
+	}
+	a.mu.Unlock()
+
+	state := &fileRequestState{
+		fileID:    msg.FileID,
+		storedMsg: stored,
+		sessionID: sessionID,
+		fromIP:    msg.FromIP,
+		fromPort:  msg.FromPort,
+		fromNick:  msg.From,
+		fileSize:  msg.FileSize,
+		scope:     msg.Scope,
+		groupID:   msg.GroupID,
+	}
+	a.fileMu.Lock()
+	a.fileRequests[msg.FileID] = state
+	a.fileMu.Unlock()
+	state.timer = time.AfterFunc(fileRequestTimeout, func() { a.fileRequestTimeout(msg.FileID) })
+
+	if isCurrent {
+		a.chatHistory.Refresh()
+		a.chatHistory.ScrollToBottom()
+	}
+	a.scheduleRefreshSidePanel()
+
+	if !a.windowFocused || !isCurrent {
+		a.fyneApp.SendNotification(fyne.NewNotification(msg.From, "[文件] "+msg.Filename))
+	}
 }
 
-func (a *App) handleFileReject(msg *model.ChatMessage) {
+// acceptIncomingFile 接收方点击"接收"后：登记接收状态、回 ChatFileAccept。
+// 消息卡片保持 ChatFileRequest，完成时才会流转到 ChatFile。
+func (a *App) acceptIncomingFile(fileID string) {
 	a.fileMu.Lock()
-	delete(a.pendingFiles, msg.FileID)
+	state, ok := a.fileRequests[fileID]
+	if !ok {
+		a.fileMu.Unlock()
+		return
+	}
+	delete(a.fileRequests, fileID)
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+
+	chunkTotal := int(state.fileSize / fileChunkSize)
+	if state.fileSize%fileChunkSize != 0 {
+		chunkTotal++
+	}
+	a.receivingFiles[fileID] = &receivingFile{
+		filename:   state.storedMsg.Filename,
+		fileSize:   state.fileSize,
+		chunkTotal: chunkTotal,
+		received:   make(map[int][]byte),
+		fromIP:     state.fromIP,
+		fromPort:   state.fromPort,
+		fromNick:   state.fromNick,
+		scope:      state.scope,
+		groupID:    state.groupID,
+		storedID:   state.storedMsg.ID,
+	}
 	a.fileMu.Unlock()
 
-	dialog.ShowInformation("文件传输", fmt.Sprintf("%s 拒绝了文件接收", msg.From), a.window)
+	reply := &model.ChatMessage{
+		Type:      model.ChatFileAccept,
+		Scope:     state.scope,
+		GroupID:   state.groupID,
+		From:      a.discovery.Nickname(),
+		FromIP:    a.discovery.LocalIP(),
+		FromPort:  a.discovery.TCPPort(),
+		Timestamp: time.Now().Unix(),
+		FileID:    fileID,
+		Filename:  state.storedMsg.Filename,
+	}
+	if u := a.discovery.GetUserByKey(model.UserKey(state.fromIP, state.fromPort)); u != nil {
+		_ = a.chatSvc.SendMessage(u.IP, u.TCPPort, reply)
+	}
+	// 接收按钮应该消失；完成时卡片会再刷新成"打开"。
+	a.refreshChatIfCurrent(state.sessionID)
 }
 
-func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string) {
-	defer func() {
-		a.fileMu.Lock()
-		delete(a.pendingFiles, fileID)
+// rejectIncomingFile 接收方点击"拒绝"：回 ChatFileReject，本地标为已拒绝。
+func (a *App) rejectIncomingFile(fileID string) {
+	a.fileMu.Lock()
+	state, ok := a.fileRequests[fileID]
+	if !ok {
 		a.fileMu.Unlock()
-	}()
+		return
+	}
+	delete(a.fileRequests, fileID)
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	a.fileMu.Unlock()
 
+	reply := &model.ChatMessage{
+		Type:      model.ChatFileReject,
+		Scope:     state.scope,
+		GroupID:   state.groupID,
+		From:      a.discovery.Nickname(),
+		FromIP:    a.discovery.LocalIP(),
+		FromPort:  a.discovery.TCPPort(),
+		Timestamp: time.Now().Unix(),
+		FileID:    fileID,
+		Filename:  state.storedMsg.Filename,
+	}
+	if u := a.discovery.GetUserByKey(model.UserKey(state.fromIP, state.fromPort)); u != nil {
+		_ = a.chatSvc.SendMessage(u.IP, u.TCPPort, reply)
+	}
+	a.updateStoredType(state.storedMsg, model.ChatFileRejected, "")
+	a.refreshChatIfCurrent(state.sessionID)
+}
+
+// fileRequestTimeout 5 分钟未确认：把消息标为传输失败。
+func (a *App) fileRequestTimeout(fileID string) {
+	a.cancelFileRequest(fileID, model.ChatFileFailed)
+}
+
+// cancelFileRequest 共用清理：从 fileRequests 删除 + 停定时器 + 更新消息状态。
+func (a *App) cancelFileRequest(fileID, newType string) {
+	a.fileMu.Lock()
+	state, ok := a.fileRequests[fileID]
+	if !ok {
+		a.fileMu.Unlock()
+		return
+	}
+	delete(a.fileRequests, fileID)
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	a.fileMu.Unlock()
+
+	a.updateStoredType(state.storedMsg, newType, "")
+	a.refreshChatIfCurrent(state.sessionID)
+}
+
+// handleFileAccept 发送方收到接收方 ACCEPT：停止定时器、开始发块。
+func (a *App) handleFileAccept(msg *model.ChatMessage) {
+	a.fileMu.Lock()
+	state, ok := a.fileRequests[msg.FileID]
+	if !ok {
+		a.fileMu.Unlock()
+		return
+	}
+	delete(a.fileRequests, msg.FileID)
+	if state.timer != nil {
+		state.timer.Stop()
+	}
+	a.fileMu.Unlock()
+
+	go a.sendFileChunks(model.UserKey(msg.FromIP, msg.FromPort), msg.FileID,
+		state.localPath, state.scope, state.groupID, state.storedMsg)
+}
+
+// handleFileReject 发送方收到接收方 REJECT：把自己的消息标为已拒绝。
+func (a *App) handleFileReject(msg *model.ChatMessage) {
+	a.cancelFileRequest(msg.FileID, model.ChatFileRejected)
+}
+
+// sendFileChunks 顺序把文件分块发出去；完成后把发送方的 ChatFileRequest 升级为 ChatFile。
+func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string, stored *model.StoredMessage) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		log.Printf("读取文件失败: %v", err)
+		a.updateStoredType(stored, model.ChatFileFailed, "")
+		a.refreshChatIfCurrent(stored.SessionID)
 		return
 	}
 
@@ -1177,6 +1381,8 @@ func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string)
 
 	user := a.discovery.GetUserByKey(targetKey)
 	if user == nil {
+		a.updateStoredType(stored, model.ChatFileFailed, "")
+		a.refreshChatIfCurrent(stored.SessionID)
 		return
 	}
 
@@ -1186,7 +1392,6 @@ func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string)
 		if end > len(data) {
 			end = len(data)
 		}
-
 		chunk := base64.StdEncoding.EncodeToString(data[start:end])
 		chunkMsg := &model.ChatMessage{
 			Type:       model.ChatFileData,
@@ -1202,14 +1407,14 @@ func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string)
 			ChunkIdx:   i,
 			ChunkTotal: chunkTotal,
 		}
-
 		if err := a.chatSvc.SendMessage(user.IP, user.TCPPort, chunkMsg); err != nil {
 			log.Printf("发送文件块 %d/%d 失败: %v", i+1, chunkTotal, err)
+			a.updateStoredType(stored, model.ChatFileFailed, "")
+			a.refreshChatIfCurrent(stored.SessionID)
 			return
 		}
 	}
 
-	// 发送完成确认
 	completeMsg := &model.ChatMessage{
 		Type:      model.ChatFileComplete,
 		Scope:     scope,
@@ -1223,35 +1428,9 @@ func (a *App) sendFileChunks(targetKey, fileID, filePath, scope, groupID string)
 	}
 	_ = a.chatSvc.SendMessage(user.IP, user.TCPPort, completeMsg)
 
-	// 发送方也在聊天记录中显示
-	sessionID := targetKey
-	if scope == model.ScopeGroup {
-		sessionID = groupID
-	}
-	stored := &model.StoredMessage{
-		SessionID: sessionID,
-		Scope:     scope,
-		FromNick:  a.discovery.Nickname(),
-		FromIP:    a.discovery.LocalIP(),
-		FromPort:  a.discovery.TCPPort(),
-		Type:      model.ChatFile,
-		Content:   filePath,
-		Filename:  filename,
-		Timestamp: time.Now().Unix(),
-	}
-	_ = a.store.SaveMessage(stored)
-
-	a.mu.Lock()
-	if s, ok := a.sessions[sessionID]; ok {
-		s.messages = append(s.messages, stored)
-	}
-	isCurrentSession := a.currentSID == sessionID
-	a.mu.Unlock()
-
-	if isCurrentSession {
-		a.chatHistory.Refresh()
-		a.chatHistory.ScrollToBottom()
-	}
+	// 发送方：把 ChatFileRequest 升级成 ChatFile，Content = 本地原路径
+	a.updateStoredType(stored, model.ChatFile, filePath)
+	a.refreshChatIfCurrent(stored.SessionID)
 }
 
 func (a *App) handleFileData(msg *model.ChatMessage) {
@@ -1261,7 +1440,6 @@ func (a *App) handleFileData(msg *model.ChatMessage) {
 		a.fileMu.Unlock()
 		return
 	}
-
 	data, err := base64.StdEncoding.DecodeString(msg.Content)
 	if err != nil {
 		a.fileMu.Unlock()
@@ -1282,57 +1460,122 @@ func (a *App) handleFileComplete(msg *model.ChatMessage) {
 	delete(a.receivingFiles, msg.FileID)
 	a.fileMu.Unlock()
 
-	// 拼接所有块
 	var fileData []byte
 	for i := 0; i < rf.chunkTotal; i++ {
 		chunk, exists := rf.received[i]
 		if !exists {
 			log.Printf("文件块 %d 缺失", i)
+			a.updateStoredTypeByID(rf.storedID, model.ChatFileFailed, "")
 			return
 		}
 		fileData = append(fileData, chunk...)
 	}
 
-	// 写入文件
 	destPath := filepath.Join(a.store.FileDir(), fmt.Sprintf("%d_%s", time.Now().Unix(), rf.filename))
 	if err := os.WriteFile(destPath, fileData, 0644); err != nil {
 		log.Printf("写入文件失败: %v", err)
+		a.updateStoredTypeByID(rf.storedID, model.ChatFileFailed, "")
 		return
 	}
 
-	// 保存聊天记录
+	// 接收方的 ChatFileRequest 消息流转为 ChatFile，Content = 本地路径
+	a.updateStoredTypeByID(rf.storedID, model.ChatFile, destPath)
+
 	sessionID := model.UserKey(rf.fromIP, rf.fromPort)
 	if rf.scope == model.ScopeGroup {
 		sessionID = rf.groupID
 	}
-	stored := &model.StoredMessage{
-		SessionID: sessionID,
-		Scope:     rf.scope,
-		FromNick:  rf.fromNick,
-		FromIP:    rf.fromIP,
-		FromPort:  rf.fromPort,
-		Type:      model.ChatFile,
-		Content:   destPath,
-		Filename:  rf.filename,
-		Timestamp: time.Now().Unix(),
-	}
-	_ = a.store.SaveMessage(stored)
-
-	a.mu.Lock()
-	s, exists := a.sessions[sessionID]
-	if !exists {
-		s = &session{id: sessionID, scope: rf.scope, label: rf.fromNick}
-		a.sessions[sessionID] = s
-	}
-	s.messages = append(s.messages, stored)
-	isCurrentSession := a.currentSID == sessionID
-	a.mu.Unlock()
-
-	if isCurrentSession {
-		a.chatHistory.Refresh()
-		a.chatHistory.ScrollToBottom()
-	}
+	a.refreshChatIfCurrent(sessionID)
 	a.scheduleRefreshSidePanel()
+}
+
+// updateStoredType 就地更新 StoredMessage 的 Type/Content，并写回 DB。
+func (a *App) updateStoredType(stored *model.StoredMessage, newType, newContent string) {
+	a.mu.Lock()
+	stored.Type = newType
+	stored.Content = newContent
+	a.mu.Unlock()
+	if err := a.store.UpdateMessageTypeContent(stored.ID, newType, newContent); err != nil {
+		log.Printf("更新消息状态失败: %v", err)
+	}
+}
+
+// updateStoredTypeByID 通过 ID 找到会话里的消息并更新；主要给接收方完成/失败时用。
+func (a *App) updateStoredTypeByID(id int64, newType, newContent string) {
+	a.mu.Lock()
+	for _, s := range a.sessions {
+		for _, m := range s.messages {
+			if m.ID == id {
+				m.Type = newType
+				m.Content = newContent
+				break
+			}
+		}
+	}
+	a.mu.Unlock()
+	if err := a.store.UpdateMessageTypeContent(id, newType, newContent); err != nil {
+		log.Printf("更新消息状态失败: %v", err)
+	}
+}
+
+// refreshChatIfCurrent 仅当目标会话就是当前选中会话时，刷新聊天区。
+func (a *App) refreshChatIfCurrent(sessionID string) {
+	a.mu.Lock()
+	isCurrent := a.currentSID == sessionID
+	a.mu.Unlock()
+	if isCurrent {
+		a.chatHistory.Refresh()
+	}
+}
+
+// setupFileCard 根据消息 Type 切换文件卡片的按钮/状态区显示。
+func (a *App) setupFileCard(msg *model.StoredMessage, isMine bool,
+	fileMeta *canvas.Text,
+	fileOpenBtn, fileAcceptBtn, fileRejectBtn *widget.Button,
+	fileStatusLabel *widget.Label) {
+	// 默认全部隐藏，再按 Type 打开需要的
+	fileOpenBtn.Hide()
+	fileAcceptBtn.Hide()
+	fileRejectBtn.Hide()
+	fileStatusLabel.Hide()
+
+	fileMeta.Color = theme.Color(theme.ColorNameDisabled)
+
+	switch msg.Type {
+	case model.ChatFile:
+		meta := "文件"
+		if fi, err := os.Stat(msg.Content); err == nil {
+			meta = formatFileSize(fi.Size())
+		}
+		fileMeta.Text = meta
+		fileMeta.Refresh()
+		fileOpenBtn.Show()
+		localPath := msg.Content
+		fileOpenBtn.OnTapped = func() { openPath(localPath) }
+	case model.ChatFileRequest:
+		fileMeta.Text = "文件"
+		fileMeta.Refresh()
+		fileID := msg.Content
+		if isMine {
+			fileStatusLabel.SetText("等待对方接受…")
+			fileStatusLabel.Show()
+		} else {
+			fileAcceptBtn.Show()
+			fileRejectBtn.Show()
+			fileAcceptBtn.OnTapped = func() { a.acceptIncomingFile(fileID) }
+			fileRejectBtn.OnTapped = func() { a.rejectIncomingFile(fileID) }
+		}
+	case model.ChatFileRejected:
+		fileMeta.Text = ""
+		fileMeta.Refresh()
+		fileStatusLabel.SetText("已拒绝")
+		fileStatusLabel.Show()
+	case model.ChatFileFailed:
+		fileMeta.Text = ""
+		fileMeta.Refresh()
+		fileStatusLabel.SetText("传输失败")
+		fileStatusLabel.Show()
+	}
 }
 
 // appTheme 全局主题：在用户选定的基础主题上做若干定制。
@@ -1372,20 +1615,32 @@ func (t *appTheme) Size(n fyne.ThemeSizeName) float32 {
 }
 
 // bubbleContentTheme 用于气泡内文本 Entry 的局部主题：
-// 只把 InputBackground 改成透明，让气泡自己的底色透出来，其它走外层 appTheme。
+//   - InputBackground 透明，让气泡底色透出来
+//   - 滚动条透明 + 尺寸为 0，隐藏 Entry 在 Wrap 模式下一定会创建的滚动条
+//
+// 其它走外层 appTheme。
 type bubbleContentTheme struct {
 	base fyne.Theme
 }
 
 func (t *bubbleContentTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
-	if n == theme.ColorNameInputBackground {
+	switch n {
+	case theme.ColorNameInputBackground:
+		return color.Transparent
+	case theme.ColorNameScrollBar, theme.ColorNameScrollBarBackground:
 		return color.Transparent
 	}
 	return t.base.Color(n, v)
 }
-func (t *bubbleContentTheme) Font(s fyne.TextStyle) fyne.Resource  { return t.base.Font(s) }
+func (t *bubbleContentTheme) Font(s fyne.TextStyle) fyne.Resource    { return t.base.Font(s) }
 func (t *bubbleContentTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return t.base.Icon(n) }
-func (t *bubbleContentTheme) Size(n fyne.ThemeSizeName) float32    { return t.base.Size(n) }
+func (t *bubbleContentTheme) Size(n fyne.ThemeSizeName) float32 {
+	switch n {
+	case theme.SizeNameScrollBar, theme.SizeNameScrollBarSmall:
+		return 0
+	}
+	return t.base.Size(n)
+}
 
 // wrapBaseTheme 从设置字符串解析出基础主题并包一层 appTheme。
 func wrapBaseTheme(setting string) fyne.Theme {
@@ -1560,20 +1815,21 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		}
 		h := innerPadV + nameSize.Height + nameGap + 150
 		return w, h
-	case model.ChatFile:
-		// 文件卡片：固定偏宽
+	case model.ChatFile, model.ChatFileRequest, model.ChatFileRejected, model.ChatFileFailed:
+		// 文件卡片：固定偏宽（文件名 + 状态/按钮区）
 		w := maxBubbleW * 0.65
-		if w < 260 {
-			w = 260
+		if w < 280 {
+			w = 280
 		}
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		// 文件卡片内含图标 + 文件名 + meta 行，大约 lineH*2 + pad
-		h := innerPadV + nameSize.Height + nameGap + lineH*2 + pad
+		// 文件卡片内含图标 + 文件名 + 底部一行（meta + 按钮/状态），大约 2 行文本 + 按钮高度
+		btnH := lineH + pad*2 // 按钮高度近似
+		h := innerPadV + nameSize.Height + nameGap + lineH + btnH + pad
 		return w, h
 	default:
-		// 文本：按行测量，超过 maxContentW 则模拟换行
+		// 文本：按行测量，超过 maxContentW 则模拟换行（ceil）
 		lines := 0
 		maxLineW := float32(0)
 		for _, line := range strings.Split(msg.Content, "\n") {
@@ -1588,7 +1844,11 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 					maxLineW = lineW
 				}
 			} else {
-				n := int(lineW/maxContentW) + 1
+				// ceil(lineW / maxContentW)
+				n := int(lineW / maxContentW)
+				if lineW > float32(n)*maxContentW {
+					n++
+				}
 				lines += n
 				maxLineW = maxContentW
 			}
@@ -1604,7 +1864,9 @@ func (a *App) measureBubble(msg *model.StoredMessage, nameText string) (float32,
 		if w > maxBubbleW {
 			w = maxBubbleW
 		}
-		h := innerPadV + nameSize.Height + nameGap + float32(lines)*effLineH + pad/2
+		// Entry 内部 scroll 上下各留 InnerPadding（默认 8），这里算 *2
+		entryOverhead := theme.InnerPadding() * 2
+		h := innerPadV + nameSize.Height + nameGap + float32(lines)*effLineH + entryOverhead
 		return w, h
 	}
 }
@@ -1646,6 +1908,14 @@ func otherBubbleColor(variant fyne.ThemeVariant) color.Color {
 		return color.NRGBA{R: 62, G: 62, B: 64, A: 255} // 深灰
 	}
 	return color.NRGBA{R: 244, G: 244, B: 246, A: 255} // 近白
+}
+
+// toolbarBgColor 输入框上方工具栏条带的底色，浅色模式用淡灰，深色模式用偏暗灰。
+func toolbarBgColor(variant fyne.ThemeVariant) color.Color {
+	if variant == theme.VariantDark {
+		return color.NRGBA{R: 52, G: 52, B: 55, A: 255}
+	}
+	return color.NRGBA{R: 238, G: 238, B: 242, A: 255}
 }
 
 // openPath 用系统默认程序打开文件或目录

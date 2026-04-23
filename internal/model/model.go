@@ -23,11 +23,15 @@ const (
 	ChatFile  = "file" // 文件传输完成后在聊天记录中显示
 
 	// 文件传输控制消息
-	ChatFileRequest  = "file_request"  // 请求发送文件
-	ChatFileAccept   = "file_accept"   // 接受文件
-	ChatFileReject   = "file_reject"   // 拒绝文件
-	ChatFileData     = "file_data"     // 文件数据块
-	ChatFileComplete = "file_complete" // 传输完成
+	ChatFileRequest  = "file_request"  // 请求发送文件（消息卡片初始状态，入库）
+	ChatFileAccept   = "file_accept"   // 接受文件（控制信令，不入库）
+	ChatFileReject   = "file_reject"   // 拒绝文件（控制信令，不入库）
+	ChatFileData     = "file_data"     // 文件数据块（控制信令，不入库）
+	ChatFileComplete = "file_complete" // 传输完成（控制信令，不入库）
+
+	// 仅本地存储用的终态
+	ChatFileRejected = "file_rejected" // 对方/自己拒绝
+	ChatFileFailed   = "file_failed"   // 5 分钟未响应或传输失败
 )
 
 // TCP 消息范围

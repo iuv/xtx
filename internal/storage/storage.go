@@ -104,12 +104,27 @@ func (s *DB) FileDir() string {
 	return filepath.Join(s.dataDir, "files")
 }
 
-// SaveMessage 保存聊天记录
+// SaveMessage 保存聊天记录。成功时把新行的 ID 回填到 msg.ID。
 func (s *DB) SaveMessage(msg *model.StoredMessage) error {
-	_, err := s.db.Exec(
+	res, err := s.db.Exec(
 		`INSERT INTO messages (session_id, scope, from_nick, from_ip, from_port, type, content, filename, timestamp)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		msg.SessionID, msg.Scope, msg.FromNick, msg.FromIP, msg.FromPort, msg.Type, msg.Content, msg.Filename, msg.Timestamp,
+	)
+	if err != nil {
+		return err
+	}
+	if id, e := res.LastInsertId(); e == nil {
+		msg.ID = id
+	}
+	return nil
+}
+
+// UpdateMessageTypeContent 按 ID 更新消息的 type 与 content，用于文件传输状态流转。
+func (s *DB) UpdateMessageTypeContent(id int64, newType, newContent string) error {
+	_, err := s.db.Exec(
+		`UPDATE messages SET type = ?, content = ? WHERE id = ?`,
+		newType, newContent, id,
 	)
 	return err
 }

@@ -1,7 +1,11 @@
 package ui
 
 import (
+	"image/color"
+
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -52,7 +56,11 @@ func newReadOnlyEntry() *readOnlyEntry {
 	e := &readOnlyEntry{}
 	e.ExtendBaseWidget(e)
 	e.MultiLine = true
-	e.Wrapping = fyne.TextWrapWord
+	// TextWrapBreak：任何超过宽度的一行都在字符边界硬换行，
+	// 避免长串没空格/单词时溢出气泡。
+	e.Wrapping = fyne.TextWrapBreak
+	// 默认多行 Entry 最少 3 行，单行消息会撑出很大高度，降到 1 行。
+	e.SetMinRowsVisible(1)
 	return e
 }
 
@@ -75,3 +83,38 @@ func (e *readOnlyEntry) TypedShortcut(s fyne.Shortcut) {
 		e.Entry.TypedShortcut(s)
 	}
 }
+
+// imageTapper 是盖在气泡图片之上的透明点击层。
+// 用 widget.Button 做点击层会在鼠标悬停时画一层灰色 overlay，
+// 这里自己实现一个只响应 Tapped、鼠标移入只改光标的最小组件。
+type imageTapper struct {
+	widget.BaseWidget
+	onTapped func()
+}
+
+func newImageTapper() *imageTapper {
+	t := &imageTapper{}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *imageTapper) CreateRenderer() fyne.WidgetRenderer {
+	r := canvas.NewRectangle(color.Transparent)
+	return widget.NewSimpleRenderer(r)
+}
+
+func (t *imageTapper) Tapped(*fyne.PointEvent) {
+	if t.onTapped != nil {
+		t.onTapped()
+	}
+}
+
+// 实现 desktop.Cursorable，鼠标移入变指针光标，但不画背景高亮。
+func (t *imageTapper) Cursor() desktop.Cursor {
+	return desktop.PointerCursor
+}
+
+// 空实现，仅为避免 Fyne 的 tap-hover 回退链对 MouseIn/Out 的推测导致上色。
+func (t *imageTapper) MouseIn(*desktop.MouseEvent)    {}
+func (t *imageTapper) MouseMoved(*desktop.MouseEvent) {}
+func (t *imageTapper) MouseOut()                      {}
