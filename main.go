@@ -77,6 +77,16 @@ func main() {
 			disc.SetExtraBroadcastAddrs(addrs)
 		}
 	}
+	// 加载跨网段扫描目标
+	if scanTargets, _ := store.GetSetting("scan_targets"); scanTargets != "" {
+		lines := strings.Split(scanTargets, "\n")
+		if n, errs := disc.SetScanTargets(lines); n > 0 {
+			fmt.Printf("已加载扫描目标 %d 个 IP\n", n)
+			for _, e := range errs {
+				log.Printf("扫描目标解析提示: %s", e)
+			}
+		}
+	}
 
 	fmt.Printf("XTX 启动成功 - 昵称: %s, IP: %s, TCP: %d, UDP: %d\n",
 		nickname, disc.LocalIP(), *tcpPort, *udpPort)

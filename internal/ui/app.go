@@ -2430,10 +2430,43 @@ func (a *App) showSettingsDialog() {
 	addrsEntry := widget.NewMultiLineEntry()
 	addrsEntry.SetPlaceHolder("每行一个广播地址，如 192.168.2.255")
 	addrsEntry.SetText(extraAddrs)
-	addrsEntry.SetMinRowsVisible(4)
+	addrsEntry.SetMinRowsVisible(3)
+
+	scanTargetsText, _ := a.store.GetSetting("scan_targets")
+	scanEntry := widget.NewMultiLineEntry()
+	scanEntry.SetPlaceHolder("每行一个目标。支持：\n  10.10.1.5\n  10.10.1.0/24\n  10.10.10.*       (只允许末位通配)\n  10.10.10.5-50    (只允许末位范围)")
+	scanEntry.SetText(scanTargetsText)
+	scanEntry.SetMinRowsVisible(4)
+
+	scanNowBtn := widget.NewButton("立即扫描", func() {
+		// 用对话框中当前文本（未保存的也算），让用户能边调边试
+		lines := strings.Split(scanEntry.Text, "\n")
+		n, errs := a.discovery.SetScanTargets(lines)
+		if n == 0 {
+			msg := "未解析出任何目标"
+			if len(errs) > 0 {
+				msg += "\n" + strings.Join(errs, "\n")
+			}
+			dialog.ShowInformation("扫描", msg, a.window)
+			return
+		}
+		go func() {
+			sent := a.discovery.ScanNow()
+			summary := fmt.Sprintf("扫描完成：目标 %d 个 IP，发出 %d 个探测包", n, sent)
+			if len(errs) > 0 {
+				summary += "\n\n解析提示:\n" + strings.Join(errs, "\n")
+			}
+			dialog.ShowInformation("扫描", summary, a.window)
+		}()
+	})
+
 	networkTab := container.NewVBox(
 		widget.NewLabel("额外广播地址:"),
 		addrsEntry,
+		widget.NewSeparator(),
+		widget.NewLabel("跨网段扫描目标 (UDP 单播探测):"),
+		scanEntry,
+		container.NewHBox(scanNowBtn),
 	)
 
 	// Tab 3: 外观设置
@@ -2486,6 +2519,15 @@ func (a *App) showSettingsDialog() {
 		}
 		a.discovery.SetExtraBroadcastAddrs(addrs)
 
+		// 保存扫描目标
+		scanText := strings.TrimSpace(scanEntry.Text)
+		_ = a.store.SetSetting("scan_targets", scanText)
+		var scanLines []string
+		if scanText != "" {
+			scanLines = strings.Split(scanText, "\n")
+		}
+		a.discovery.SetScanTargets(scanLines)
+
 		// 保存发送模式
 		if sendModeSelect.Selected == "Ctrl+Enter 发送" {
 			_ = a.store.SetSetting("send_mode", "ctrl_enter")
@@ -2514,7 +2556,7 @@ func (a *App) showSettingsDialog() {
 		_ = a.store.SetSetting("theme", themeVal)
 	}, a.window)
 
-	dlg.Resize(fyne.NewSize(450, 350))
+	dlg.Resize(fyne.NewSize(520, 480))
 	dlg.Show()
 }
 

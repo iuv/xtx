@@ -42,6 +42,7 @@ type Service struct {
 	users           map[string]*model.User  // key: IP:TCPPort
 	groups          map[string]*model.Group  // key: GroupID
 	extraBroadcast  []string                 // 额外广播地址
+	scanIPs         []net.IP                 // 跨网段单播扫描目标（已展开）
 	mu              sync.RWMutex
 
 	events chan Event
@@ -169,6 +170,8 @@ func (s *Service) Start() error {
 	go s.heartbeat()
 	// 启动超时检测协程
 	go s.checkTimeout()
+	// 启动跨网段扫描协程（无目标时空转，开销可忽略）
+	go s.scanLoop()
 
 	return nil
 }
